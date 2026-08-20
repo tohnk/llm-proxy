@@ -1,6 +1,8 @@
 # llm-proxy
 
-A local resilient HTTP proxy in Rust that sits between an OpenAI-compatible client (such as [Jan.ai](https://jan.ai)) and an OpenAI-compatible upstream (e.g. Google's Gemini OpenAI compatibility endpoint or local models), ensuring streaming SSE responses survive transient upstream failures (TCP resets, mid-stream disconnects, HTTP 429/5xx, and stalls).
+A local resilient HTTP proxy in Rust that sits between an OpenAI-compatible client (such as [Jan.ai](https://jan.ai)) and an OpenAI-compatible upstream, ensuring streaming SSE responses survive transient upstream failures (TCP resets, mid-stream disconnects, HTTP 429/5xx, and stalls).
+
+**It is built and tuned for Google's Gemini OpenAI-compatibility endpoint**, which is what the shipped defaults target. It works with any OpenAI-compatible upstream — OpenAI itself, a local llama.cpp / Ollama / LM Studio server, OpenRouter — but expect to change some configuration. See [Upstream compatibility](#upstream-compatibility).
 
 ---
 
@@ -15,12 +17,40 @@ A local resilient HTTP proxy in Rust that sits between an OpenAI-compatible clie
 
 ---
 
-## Continuation Modes
+## Upstream compatibility
 
-The proxy supports two continuation modes for resuming broken streams:
+The defaults target Google's Gemini OpenAI-compatibility endpoint. Pointing at a different
+upstream is supported and usually means changing two or three settings.
 
-- **`prefix` (`ContinuationMode::Prefix`, default):** Appends the accumulated partial response as a trailing assistant message in the conversation context. Upstream models that support prefix continuation continue generating smoothly from the cutoff point.
-- **`instructed` (`ContinuationMode::Instructed`):** Appends the partial assistant turn followed by an explicit instruction turn requesting continuation without repetition. Used as a fallback when an upstream model restarts or errors on trailing assistant turns. May produce visible seams and relies on the overlap deduplication window.
+| Setting | Default | When to change it |
+|---|---|---|
+| `upstream.base_url` | Gemini's `/v1beta/openai` | Always, for a non-Gemini upstream. Use the base that has `/chat/completions` under it — e.g. `https://api.openai.com/v1`, or `http://localhost:11434/v1` for Ollama. |
+| `upstream.api_key_env` | `GEMINI_API_KEY` | Point it at whichever variable holds your key (`OPENAI_API_KEY`, …). Local servers usually need no key; leave the variable unset. |
+| `resume.mode` | `instructed` | Set to `prefix` if your upstream accepts a trailing assistant turn — see below. |
+
+### Continuation modes
+
+When a stream breaks, the proxy re-issues the request with the partial output as context.
+There are two ways to phrase that, and the right one depends on the upstream:
+
+- **`instructed` (default):** appends the partial assistant turn followed by an explicit
+  user turn asking the model to continue without repeating. Works everywhere. Any seam at
+  the join is absorbed by the overlap deduplication window.
+- **`prefix`:** appends the partial response as a trailing assistant message and lets the
+  model continue straight from it. Gives zero-seam resumption — *when the upstream allows
+  it*.
+
+**Gemini does not allow it.** Its OpenAI-compatibility endpoint rejects any request whose
+messages end with an assistant turn:
+
+```
+400 INVALID_ARGUMENT — "Requests ending with a model turn are not supported."
+```
+
+That rejection only hits the *continuation* request, so with `mode = "prefix"` everything
+looks fine until the first dropped stream — the one moment the proxy exists for. Hence
+`instructed` is the default. If you point this at an upstream that does support prefix
+continuation (OpenAI, most local servers), `mode = "prefix"` is the better choice.
 
 ---
 
@@ -55,7 +85,7 @@ connect_timeout_secs = 10
 
 [resume]
 enabled = true
-mode = "prefix"                     # "prefix" | "instructed"
+mode = "instructed"                 # "prefix" | "instructed"
 max_attempts = 6
 max_wall_clock_secs = 900
 backoff_initial_ms = 500

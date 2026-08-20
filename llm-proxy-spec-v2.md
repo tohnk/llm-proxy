@@ -24,6 +24,8 @@ streaming responses survive transient upstream failures.
 > 5. The downstream body limit is **raised and configurable**, because axum's 2 MiB default
 >    rejects legitimate long conversations (§4, §5).
 > 6. Re-emitted upstream `code`/`param` keep their **original JSON types** (§5).
+> 7. `ContinuationMode::Instructed` is now the **default**, because the default upstream
+>    rejects the trailing assistant turn that `Prefix` builds (§2.1).
 >
 > §3.1 records the downstream-channel properties that any change to the streaming path must
 > preserve, independent of the payload type.
@@ -54,10 +56,42 @@ Two facts govern upstream compatibility:
 
 1. **Wire Failure Types:** TCP reset mid-stream, HTTP 429/503 status codes, and idle silent stalls. All three are handled by dedicated transport recovery, backoff, and watchdog timers (§8).
 2. **Continuation Behavior:**
-   - **`ContinuationMode::Prefix` (default):** Sends partial output in a trailing `assistant` message. If the model continues smoothly from that prefix, this mode gives zero-seam resumption.
-   - **`ContinuationMode::Instructed`:** When an upstream model does not support trailing assistant turns or restarts from the beginning, appends the assistant turn plus an explicit instruction turn to continue without repetition. Handled via the overlap deduplication window (§6.3).
+   - **`ContinuationMode::Prefix`:** Sends partial output in a trailing `assistant` message. If the model continues smoothly from that prefix, this mode gives zero-seam resumption.
+   - **`ContinuationMode::Instructed` (default):** For upstreams that do not support trailing assistant turns, or that restart from the beginning, appends the assistant turn followed by an explicit instruction turn to continue without repetition. Any seam is absorbed by the overlap deduplication window (§6.3).
 
 Both modes are supported behind the `resume.mode` configuration option.
+
+### 2.1 Verified upstream behaviour — *Amended (2026-08-20)*
+
+The verification this section calls for has now been performed against the default
+upstream, and it settles the default.
+
+**Google's OpenAI-compatibility endpoint rejects `Prefix` continuations outright.** A
+request whose `messages` end with an assistant turn returns:
+
+```
+400 INVALID_ARGUMENT — "Requests ending with a model turn are not supported."
+```
+
+Confirmed 2026-08-20 against `models/gemini-3.7-flash` by sending both shapes directly:
+`[user, assistant]` fails with the above; `[user, assistant, user("Continue…")]` succeeds
+and continues cleanly — given `"1, 2, 3,"` it returned `" 4, 5, 6"`, with no repetition,
+restatement, or acknowledgement of the instruction.
+
+Because the endpoint accepts the first attempt and only rejects the *continuation*, the
+failure surfaces exactly when the proxy matters most: the first dropped stream, on the
+retry that was supposed to rescue it. `Prefix` is therefore not merely suboptimal here —
+it silently disables the proxy's entire purpose against its own default upstream.
+
+**`Instructed` is consequently the default.** A default `resume.mode` that cannot resume
+against the default `upstream.base_url` is not a usable default. Deployments pointed at an
+upstream that does support trailing assistant turns may set `mode = "prefix"` for zero-seam
+resumption.
+
+The trailing role is a compatibility contract rather than an internal detail, so it is
+pinned by test: `test_instructed_continuation_never_ends_with_an_assistant_turn` and
+`test_default_continuation_mode_is_compatible_with_default_upstream` assert the exact
+`messages` array each mode sends upstream.
 
 ---
 
@@ -120,7 +154,7 @@ connect_timeout_secs = 10
 
 [resume]
 enabled = true
-mode = "prefix"                     # "prefix" | "instructed"
+mode = "instructed"                 # "prefix" | "instructed" — see §2.1
 max_attempts = 6                    # total upstream attempts per downstream request
 max_wall_clock_secs = 900           # hard ceiling across all attempts
 backoff_initial_ms = 500

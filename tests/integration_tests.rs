@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use llm_proxy::config::{Config, ContinuationMode};
 use llm_proxy::create_app;
 use llm_proxy::mock::{create_mock_app, default_corpus, MockServerState};
+use llm_proxy::proxy::continuation::INSTRUCTED_USER_PROMPT;
 
 struct TestHarness {
     pub _mock_addr: SocketAddr,
@@ -2094,4 +2095,95 @@ async fn test_request_body_limit_is_configurable() {
         .unwrap();
 
     assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ---------------------------------------------------------------------------
+// Continuation request shape (§6.4)
+//
+// Pins the exact `messages` array each mode sends upstream. Google's
+// OpenAI-compatibility endpoint rejects any request whose messages end with an
+// assistant turn — "Requests ending with a model turn are not supported" — so
+// the trailing role is a compatibility contract, not an internal detail.
+// ---------------------------------------------------------------------------
+
+async fn continuation_body_after_a_cut(mode: ContinuationMode) -> Value {
+    let harness = TestHarness::setup(move |config| {
+        config.upstream.base_url = format!(
+            "{}/chat/completions?cut_after=5&cut_first_n_requests=1",
+            config.upstream.base_url
+        );
+        config.resume.mode = mode;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(result.text, default_corpus(), "resumption should complete");
+
+    let body = harness
+        .mock_state
+        .last_received_body
+        .lock()
+        .await
+        .clone()
+        .expect("upstream should have received a continuation request");
+    body
+}
+
+#[tokio::test]
+async fn test_prefix_continuation_ends_with_the_assistant_turn() {
+    let body = continuation_body_after_a_cut(ContinuationMode::Prefix).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("Line 1\n"));
+}
+
+#[tokio::test]
+async fn test_instructed_continuation_never_ends_with_an_assistant_turn() {
+    let body = continuation_body_after_a_cut(ContinuationMode::Instructed).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("Line 1\n"));
+
+    // The load-bearing assertion: upstreams that refuse a trailing model turn
+    // must see a user turn last.
+    assert_eq!(
+        messages[2]["role"], "user",
+        "instructed mode must not end on an assistant turn"
+    );
+    assert_eq!(messages[2]["content"], INSTRUCTED_USER_PROMPT);
+}
+
+// The shipped default must work against the shipped default upstream.
+#[tokio::test]
+async fn test_default_continuation_mode_is_compatible_with_default_upstream() {
+    assert_eq!(Config::default().resume.mode, ContinuationMode::Instructed);
+
+    let body = continuation_body_after_a_cut(Config::default().resume.mode).await;
+    let messages = body["messages"].as_array().unwrap();
+    assert_ne!(
+        messages.last().unwrap()["role"],
+        "assistant",
+        "the default mode builds a request Gemini would reject with a 400"
+    );
 }

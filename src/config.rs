@@ -24,8 +24,13 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContinuationMode {
-    #[default]
     Prefix,
+    /// Default because the default `base_url` is Google's OpenAI-compatibility
+    /// endpoint, which rejects any request whose messages end with an assistant
+    /// turn ("Requests ending with a model turn are not supported") — exactly
+    /// what `Prefix` builds. A default that cannot resume against the default
+    /// upstream is not a usable default. See §2 of the spec.
+    #[default]
     Instructed,
 }
 
@@ -499,7 +504,7 @@ mod tests {
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         assert_eq!(config.server.max_body_bytes, 32 * 1024 * 1024);
         assert_eq!(config.upstream.connect_timeout_secs, 10);
-        assert_eq!(config.resume.mode, ContinuationMode::Prefix);
+        assert_eq!(config.resume.mode, ContinuationMode::Instructed);
         assert_eq!(config.resume.max_attempts, 6);
         assert_eq!(config.resume.dedup_window_chars, 240);
         assert!(config.resume.enabled);
