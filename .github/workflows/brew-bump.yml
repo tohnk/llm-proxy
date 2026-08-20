@@ -1,0 +1,16 @@
+name: Update Homebrew Tap
+on:
+  release:
+    types: [published]
+jobs:
+  update-tap:
+    runs-on: macos-latest
+    steps:
+      - name: Bump Homebrew Formula
+        uses: mislav/bump-homebrew-formula-action@v4
+        with:
+          formula-name: llm-proxy
+          homebrew-tap: tohnk/homebrew-tap
+          download-url: https://github.com/tohnk/llm-proxy/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz
+        env:
+          COMMITTER_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
