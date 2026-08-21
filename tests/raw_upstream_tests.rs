@@ -444,11 +444,12 @@ async fn test_connection_closed_before_response_head_is_retried() {
     assert!(result.errors.is_empty());
 }
 
-/// A TLS error is retryable (§7), and when it never clears the proxy must give
-/// up the way §7 prescribes: a clean `stop` finish chunk and one `[DONE]`, with
-/// no synthetic error text injected into the user's chat stream.
+/// A TLS error is retryable (§7), and when it never clears the proxy gives up.
+/// Nothing was ever emitted downstream here, so §7's "clean stop" — which exists
+/// to protect a partial answer — would leave the client with a silent, empty,
+/// apparently-successful response. The real upstream error goes out instead.
 #[tokio::test]
-async fn test_tls_failure_is_retried_then_gives_up_cleanly() {
+async fn test_tls_failure_is_retried_then_surfaces_the_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let connections = Arc::new(AtomicU32::new(0));
@@ -470,12 +471,24 @@ async fn test_tls_failure_is_retried_then_gives_up_cleanly() {
     let result = collect(&test_client(), proxy, chat_body()).await;
 
     assert!(result.text.is_empty());
-    assert!(
-        result.errors.is_empty(),
-        "give-up must not inject error text into the chat stream"
+    assert_eq!(
+        result.errors.len(),
+        1,
+        "a give-up with nothing emitted must tell the client why"
     );
-    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
-    assert_eq!(result.done_count, 1);
+    assert!(
+        result.errors[0]["message"].is_string(),
+        "the surfaced error carries the upstream cause: {:?}",
+        result.errors[0]
+    );
+    assert!(
+        result.finish_reasons.is_empty(),
+        "no synthetic `stop` should claim the empty response succeeded"
+    );
+    assert_eq!(
+        result.done_count, 1,
+        "the stream still terminates exactly once"
+    );
     assert_eq!(
         connections.load(Ordering::SeqCst),
         3,

@@ -123,6 +123,12 @@ pub struct ResumeConfig {
     pub max_attempts: u32,
     #[serde(default = "default_max_wall_clock_secs")]
     pub max_wall_clock_secs: u64,
+    /// Deadline used instead of `max_wall_clock_secs` while every failure so far
+    /// has been the upstream saying it is busy (§7.3). Only ever extends: the
+    /// effective deadline is the larger of the two, so setting this below
+    /// `max_wall_clock_secs` has no effect.
+    #[serde(default = "default_overloaded_max_wall_clock_secs")]
+    pub overloaded_max_wall_clock_secs: u64,
     #[serde(default = "default_backoff_initial_ms")]
     pub backoff_initial_ms: u64,
     #[serde(default = "default_backoff_max_ms")]
@@ -149,6 +155,9 @@ fn default_max_attempts() -> u32 {
 }
 fn default_max_wall_clock_secs() -> u64 {
     900
+}
+fn default_overloaded_max_wall_clock_secs() -> u64 {
+    300
 }
 fn default_backoff_initial_ms() -> u64 {
     500
@@ -179,6 +188,7 @@ impl Default for ResumeConfig {
             mode: ContinuationMode::default(),
             max_attempts: default_max_attempts(),
             max_wall_clock_secs: default_max_wall_clock_secs(),
+            overloaded_max_wall_clock_secs: default_overloaded_max_wall_clock_secs(),
             backoff_initial_ms: default_backoff_initial_ms(),
             backoff_max_ms: default_backoff_max_ms(),
             backoff_multiplier: default_backoff_multiplier(),
@@ -352,6 +362,13 @@ impl Config {
             self.resume.max_wall_clock_secs =
                 val.parse().map_err(|_| ConfigError::EnvOverride {
                     key: "LLM_PROXY_RESUME_MAX_WALL_CLOCK_SECS".to_string(),
+                    val,
+                })?;
+        }
+        if let Ok(val) = env::var("LLM_PROXY_RESUME_OVERLOADED_MAX_WALL_CLOCK_SECS") {
+            self.resume.overloaded_max_wall_clock_secs =
+                val.parse().map_err(|_| ConfigError::EnvOverride {
+                    key: "LLM_PROXY_RESUME_OVERLOADED_MAX_WALL_CLOCK_SECS".to_string(),
                     val,
                 })?;
         }
@@ -677,6 +694,7 @@ mod tests {
             ("LLM_PROXY_RESUME_MODE", "instructed"),
             ("LLM_PROXY_RESUME_MAX_ATTEMPTS", "11"),
             ("LLM_PROXY_RESUME_MAX_WALL_CLOCK_SECS", "1234"),
+            ("LLM_PROXY_RESUME_OVERLOADED_MAX_WALL_CLOCK_SECS", "4321"),
             ("LLM_PROXY_RESUME_BACKOFF_INITIAL_MS", "123"),
             ("LLM_PROXY_RESUME_BACKOFF_MAX_MS", "45678"),
             ("LLM_PROXY_RESUME_BACKOFF_MULTIPLIER", "3.5"),
@@ -709,6 +727,7 @@ mod tests {
         assert_eq!(config.resume.mode, ContinuationMode::Instructed);
         assert_eq!(config.resume.max_attempts, 11);
         assert_eq!(config.resume.max_wall_clock_secs, 1234);
+        assert_eq!(config.resume.overloaded_max_wall_clock_secs, 4321);
         assert_eq!(config.resume.backoff_initial_ms, 123);
         assert_eq!(config.resume.backoff_max_ms, 45678);
         assert_eq!(config.resume.backoff_multiplier, 3.5);
@@ -740,6 +759,7 @@ mod tests {
             ("LLM_PROXY_RESUME_MODE", "verbatim"),
             ("LLM_PROXY_RESUME_MAX_ATTEMPTS", "-1"),
             ("LLM_PROXY_RESUME_MAX_WALL_CLOCK_SECS", "forever"),
+            ("LLM_PROXY_RESUME_OVERLOADED_MAX_WALL_CLOCK_SECS", "ages"),
             ("LLM_PROXY_RESUME_BACKOFF_INITIAL_MS", "1.5"),
             ("LLM_PROXY_RESUME_BACKOFF_MAX_MS", "lots"),
             ("LLM_PROXY_RESUME_BACKOFF_MULTIPLIER", "double"),

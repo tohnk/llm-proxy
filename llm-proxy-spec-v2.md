@@ -26,6 +26,11 @@ streaming responses survive transient upstream failures.
 > 6. Re-emitted upstream `code`/`param` keep their **original JSON types** (§5).
 > 7. `ContinuationMode::Instructed` is now the **default**, because the default upstream
 >    rejects the trailing assistant turn that `Prefix` builds (§2.1).
+> 8. Give-up **surfaces the upstream error** when nothing was ever emitted, instead of a
+>    silent empty response (§7).
+> 9. Downstream `finish_reason` is **normalised** to the OpenAI set, and a finish reason
+>    reporting a failed generation is **retried** (§7.4).
+> 10. The wall clock **extends** while the upstream reports only congestion (§7.3).
 >
 > §3.1 records the downstream-channel properties that any change to the streaming path must
 > preserve, independent of the payload type.
@@ -157,6 +162,7 @@ enabled = true
 mode = "instructed"                 # "prefix" | "instructed" — see §2.1
 max_attempts = 6                    # total upstream attempts per downstream request
 max_wall_clock_secs = 900           # hard ceiling across all attempts
+overloaded_max_wall_clock_secs = 300 # extended ceiling while only congestion is failing (§7.3)
 backoff_initial_ms = 500
 backoff_max_ms = 30000
 backoff_multiplier = 2.0
@@ -296,7 +302,7 @@ enum AttemptOutcome {
 }
 ```
 
-**Terminal:** `finish_reason` of `stop`, `tool_calls`, `content_filter`, or `length` when `resume_on_length_finish = false`.
+**Terminal:** `finish_reason` of `stop`, `tool_calls`, `content_filter`, or `length` when `resume_on_length_finish = false`. Upstream values outside this set are normalised before being forwarded (§7.4).
 
 **Retryable:**
 - HTTP 408, 409, 425, 429, 500, 502, 503, 504
@@ -304,6 +310,7 @@ enum AttemptOutcome {
 - `first_chunk_timeout` or `idle_timeout` expiry (§8)
 - Upstream stream ending with no `finish_reason` and no `[DONE]`
 - `finish_reason: "length"` when `resume_on_length_finish = true`
+- A `finish_reason` reporting a *failed* generation rather than a finished one (§7.4)
 
 **Fatal:**
 - HTTP 400, 401, 403, 404, 413, 422
@@ -312,7 +319,69 @@ enum AttemptOutcome {
 
 **`resume.enabled = false` Semantics:** If `resume.enabled = false`, mid-stream failures do not attempt continuation; the stream terminates cleanly with a `stop` chunk. Initial pre-stream transient errors (e.g. initial 429/503 before any chunk) still follow normal retry up to `max_attempts`.
 
-**Give-up behaviour:** When attempts or wall clock are exhausted, log at error level and emit a clean finish chunk with `finish_reason: "stop"` followed by `[DONE]`. Do not inject synthetic error text into the user's chat stream.
+**Give-up behaviour — *Amended (2026-08-21)*:** When attempts or wall clock are exhausted,
+log at error level, then terminate the downstream stream in one of two ways:
+
+- **Some content was emitted.** Emit a clean finish chunk with `finish_reason: "stop"`
+  followed by `[DONE]`. Never append error text to a partial answer: the user can read what
+  arrived, and corrupting it with a proxy message is worse than a quiet truncation.
+- **Nothing was emitted.** Emit the last upstream error as an error chunk, followed by
+  `[DONE]`, and no finish chunk. A clean `stop` here would hand the client an empty but
+  apparently successful response — indistinguishable from a model that chose to say nothing,
+  and strictly less informative than the bare upstream error the client would have seen
+  without a proxy in the path. The rule against *synthetic* error text still holds: what is
+  forwarded is the upstream's own error, at protocol level, not fabricated assistant content.
+
+### 7.3 Congestion extends the deadline — *Amended (2026-08-21)*
+
+`max_attempts` and `max_wall_clock_secs` are meant to be independent ceilings, but when an
+upstream is degraded each failed attempt can cost 15–30 s, so a low attempt count exhausts
+the budget while most of the wall clock goes unused. Observed in production against Gemini:
+give-up after 6 attempts at 131 s and 120 s, against a 900 s ceiling.
+
+While **every** failure so far has been the upstream reporting congestion, the deadline
+becomes `overloaded_max_wall_clock_secs` instead:
+
+```
+deadline = if congestion_failures > 0 && other_failures == 0 {
+    max(max_wall_clock_secs, overloaded_max_wall_clock_secs)
+} else {
+    max_wall_clock_secs
+}
+```
+
+**Congestion** means HTTP **429** or **503** — the two statuses whose defined semantics are
+exactly "busy, come back later", and which describe a condition that clears on its own.
+Transport errors, timeouts and truncated streams report a fault rather than a queue, so they
+return the normal ceiling immediately.
+
+Taking the larger of the two means the setting can only ever extend, never shorten; at the
+shipped defaults (900 normal, 300 overloaded) it is inert, and it takes effect once
+`max_wall_clock_secs` is tightened to an interactive value.
+
+Recommended pairing: set `max_attempts` high enough that it never binds and let the wall
+clock be the single governor.
+
+### 7.4 Finish-reason handling — *Amended (2026-08-21)*
+
+Gemini leaks native finish reasons through its compatibility layer — `SAFETY`,
+`RECITATION`, `MAX_TOKENS`, and composite forms such as
+`function_call_filter: MALFORMED_FUNCTION_CALL`. A client switching on the OpenAI enum has
+no case for these, so the value is normalised before it goes downstream (§6.5), while the
+upstream original is logged:
+
+| Upstream contains | Downstream value |
+|---|---|
+| `safety`, `recitation`, `blocklist`, `prohibited`, `spii`, `content_filter` | `content_filter` |
+| `tool_call`, `function_call` | `tool_calls` |
+| `max_tokens`, `length` | `length` |
+| anything else | `stop` |
+
+Separately, `MALFORMED_FUNCTION_CALL` is **retryable**. It reports that the model attempted a
+tool call, emitted syntactically invalid output, and had it discarded — so the response is
+empty or truncated even though the stream ended without error. Generation is
+non-deterministic, so another attempt has a real chance of succeeding; a safety refusal, by
+contrast, would fail identically every time and stays terminal.
 
 ### 7.1 Fatal-body scanning and the 429 exception — *Amended (2026-08-20)*
 
@@ -422,7 +491,7 @@ When the downstream client disconnects (detected via mpsc channel send failure),
 ## 12. Logging
 
 - `tracing` + `tracing-subscriber`, `EnvFilter` with `RUST_LOG` or configured log level.
-- Info: request start, attempt boundaries, retries with cause/backoff, completion stats.
+- Info: request start, attempt boundaries, retries with cause/backoff, completion stats including `emitted_chars`, so a give-up can be told apart from a partial answer without guesswork.
 - Debug: dedup results (overlap character count).
 - Trace: request and response bodies (gated by `log_bodies = true`).
 - Redact Authorization headers; never log secret API keys.

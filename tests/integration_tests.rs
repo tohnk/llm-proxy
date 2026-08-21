@@ -2187,3 +2187,212 @@ async fn test_default_continuation_mode_is_compatible_with_default_upstream() {
         "the default mode builds a request Gemini would reject with a 400"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Give-up behaviour, failed generations, and the congestion deadline (§7, §7.3)
+// ---------------------------------------------------------------------------
+
+// Nothing was ever emitted, so there is no partial answer for a clean `stop` to
+// protect — and a silent empty response tells the user nothing. The real
+// upstream error must reach the client instead.
+#[tokio::test]
+async fn test_give_up_with_no_content_surfaces_the_upstream_error() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!(
+            "{}/chat/completions?status=503&fail_first=100&error_message=The+model+is+overloaded",
+            config.upstream.base_url
+        );
+        config.resume.max_attempts = 3;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(result.text.is_empty());
+    assert_eq!(
+        result.errors.len(),
+        1,
+        "the client must be told why it failed"
+    );
+    assert_eq!(result.errors[0]["message"], "The model is overloaded");
+    assert!(
+        result.finish_reasons.is_empty(),
+        "an empty response must not be reported as a completed one"
+    );
+    assert_eq!(result.done_count, 1);
+}
+
+// ...but once text has gone out, the partial answer is protected: a clean stop,
+// with no error chunk appended to corrupt what the user already sees.
+#[tokio::test]
+async fn test_give_up_with_partial_content_still_ends_cleanly() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url =
+            format!("{}/chat/completions?cut_after=5", config.upstream.base_url);
+        config.resume.max_attempts = 2;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(
+        !result.text.is_empty(),
+        "partial text should have been kept"
+    );
+    assert!(
+        result.errors.is_empty(),
+        "a partial answer must not be corrupted"
+    );
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+// A malformed function call is a failed generation, not a finished response, so
+// it is retried — and the non-OpenAI reason never reaches the client.
+#[tokio::test]
+async fn test_malformed_function_call_is_retried_and_normalised() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!(
+            "{}/chat/completions?finish_reason=function_call_filter:+MALFORMED_FUNCTION_CALL&finish_reason_first_n_requests=1",
+            config.upstream.base_url
+        );
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        harness
+            .mock_state
+            .request_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a failed generation should cost one retry"
+    );
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+// Every finish reason leaving the proxy is one an OpenAI client understands.
+#[tokio::test]
+async fn test_vendor_finish_reasons_are_normalised_downstream() {
+    for (upstream, expected) in [("SAFETY", "content_filter"), ("MAX_TOKENS", "length")] {
+        let harness = TestHarness::setup(|config| {
+            config.upstream.base_url = format!(
+                "{}/chat/completions?finish_reason={upstream}&finish_reason_first_n_requests=1",
+                config.upstream.base_url
+            );
+        })
+        .await;
+
+        let result = collect_stream_response(
+            &harness.client,
+            &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Count lines"}],
+                "stream": true
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            result.finish_reasons,
+            vec![expected.to_string()],
+            "upstream {upstream} should normalise to {expected}"
+        );
+        assert_eq!(result.done_count, 1);
+    }
+}
+
+// §7.3: while the upstream is only reporting congestion, the proxy keeps trying
+// past the normal ceiling; any other kind of failure drops it back.
+#[tokio::test]
+async fn test_congestion_extends_the_deadline_but_other_failures_do_not() {
+    let overloaded = TestHarness::setup(|config| {
+        config.upstream.base_url = format!(
+            "{}/chat/completions?status=503&fail_first=1000",
+            config.upstream.base_url
+        );
+        config.resume.max_attempts = 10_000;
+        config.resume.max_wall_clock_secs = 1;
+        config.resume.overloaded_max_wall_clock_secs = 4;
+    })
+    .await;
+
+    let started = Instant::now();
+    let result = collect_stream_response(
+        &overloaded.client,
+        &format!("http://{}/v1/chat/completions", overloaded.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+    let congested_elapsed = started.elapsed();
+
+    assert_eq!(result.done_count, 1);
+    assert!(
+        congested_elapsed >= Duration::from_secs(3),
+        "congestion should have extended past the 1s ceiling, took {congested_elapsed:?}"
+    );
+
+    // Control: the stream dies mid-transfer instead, which is a fault rather
+    // than congestion, so the normal ceiling applies.
+    let broken = TestHarness::setup(|config| {
+        config.upstream.base_url =
+            format!("{}/chat/completions?cut_after=0", config.upstream.base_url);
+        config.resume.max_attempts = 10_000;
+        config.resume.max_wall_clock_secs = 1;
+        config.resume.overloaded_max_wall_clock_secs = 4;
+    })
+    .await;
+
+    let started = Instant::now();
+    let result = collect_stream_response(
+        &broken.client,
+        &format!("http://{}/v1/chat/completions", broken.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+    let broken_elapsed = started.elapsed();
+
+    assert_eq!(result.done_count, 1);
+    assert!(
+        broken_elapsed < Duration::from_secs(3),
+        "a non-congestion failure must not get the extended deadline, took {broken_elapsed:?}"
+    );
+}

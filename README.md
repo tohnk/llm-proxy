@@ -88,6 +88,7 @@ enabled = true
 mode = "instructed"                 # "prefix" | "instructed"
 max_attempts = 6
 max_wall_clock_secs = 900
+overloaded_max_wall_clock_secs = 300
 backoff_initial_ms = 500
 backoff_max_ms = 30000
 backoff_multiplier = 2.0

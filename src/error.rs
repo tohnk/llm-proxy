@@ -28,6 +28,8 @@ pub enum Cause {
     StreamEndedUnexpectedly,
     #[error("Finish reason length resumed")]
     LengthFinishResumed,
+    #[error("Upstream reported a malformed function call")]
+    MalformedFunctionCall,
 }
 
 impl Cause {
@@ -37,6 +39,62 @@ impl Cause {
             _ => None,
         }
     }
+
+    /// True when the upstream explicitly said "I am busy, come back later".
+    ///
+    /// 429 and 503 are the two statuses whose defined semantics are exactly
+    /// that (RFC 9110: 503 is temporary overload or maintenance, 429 is rate
+    /// limiting), and both describe a condition that clears on its own. Other
+    /// retryable causes — transport errors, timeouts, truncated streams — say
+    /// something is broken, not that it is merely busy, so they do not qualify
+    /// for the extended deadline in §7.3.
+    pub fn is_congestion(&self) -> bool {
+        match self {
+            Cause::HttpStatus { status, .. } => {
+                *status == StatusCode::TOO_MANY_REQUESTS
+                    || *status == StatusCode::SERVICE_UNAVAILABLE
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Map an upstream `finish_reason` onto the set OpenAI clients understand.
+///
+/// Gemini leaks native reasons through its compatibility layer (`SAFETY`,
+/// `MALFORMED_FUNCTION_CALL`, `function_call_filter: …`), and a client that
+/// switches on the OpenAI enum has no case for them. The upstream's original
+/// value is logged; only the downstream wire value is normalised (§6.5).
+pub fn normalize_finish_reason(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("safety")
+        || lower.contains("recitation")
+        || lower.contains("blocklist")
+        || lower.contains("prohibited")
+        || lower.contains("spii")
+        || lower.contains("content_filter")
+        || lower.contains("content filter")
+    {
+        "content_filter"
+    } else if lower.contains("tool_call") || lower.contains("function_call") {
+        "tool_calls"
+    } else if lower.contains("max_tokens") || lower.contains("length") {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+/// True for finish reasons that report a failed generation rather than a
+/// finished one.
+///
+/// `MALFORMED_FUNCTION_CALL` means the model attempted a tool call and emitted
+/// syntactically invalid output, which the upstream then discarded — so the
+/// response is empty or truncated despite the stream ending "normally".
+/// Generation is non-deterministic, so another attempt has a real chance;
+/// unlike a safety refusal, which would fail identically every time.
+pub fn is_failed_generation_finish_reason(raw: &str) -> bool {
+    raw.to_ascii_lowercase().contains("malformed_function_call")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Error)]
@@ -449,6 +507,66 @@ mod tests {
         // A malformed value falls through to the standard header.
         headers.insert("retry-after-ms", HeaderValue::from_static("soon"));
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn test_normalize_finish_reason() {
+        for (raw, want) in [
+            ("stop", "stop"),
+            ("STOP", "stop"),
+            ("tool_calls", "tool_calls"),
+            (
+                "function_call_filter: MALFORMED_FUNCTION_CALL",
+                "tool_calls",
+            ),
+            ("length", "length"),
+            ("MAX_TOKENS", "length"),
+            ("SAFETY", "content_filter"),
+            ("RECITATION", "content_filter"),
+            ("PROHIBITED_CONTENT", "content_filter"),
+            ("BLOCKLIST", "content_filter"),
+            ("content_filter", "content_filter"),
+            ("OTHER", "stop"),
+            ("something_nobody_has_seen", "stop"),
+        ] {
+            assert_eq!(normalize_finish_reason(raw), want, "raw = {raw}");
+        }
+    }
+
+    #[test]
+    fn test_failed_generation_finish_reason() {
+        assert!(is_failed_generation_finish_reason(
+            "function_call_filter: MALFORMED_FUNCTION_CALL"
+        ));
+        assert!(is_failed_generation_finish_reason(
+            "malformed_function_call"
+        ));
+        // A safety refusal is deterministic; retrying it is pointless.
+        assert!(!is_failed_generation_finish_reason("SAFETY"));
+        assert!(!is_failed_generation_finish_reason("stop"));
+        assert!(!is_failed_generation_finish_reason("tool_calls"));
+    }
+
+    #[test]
+    fn test_congestion_causes() {
+        let busy = |code: u16| Cause::HttpStatus {
+            status: StatusCode::from_u16(code).unwrap(),
+            retry_after: None,
+            body: String::new(),
+        };
+        assert!(busy(429).is_congestion());
+        assert!(busy(503).is_congestion());
+        // Other retryable statuses report a fault, not congestion.
+        for code in [408, 409, 425, 500, 502, 504] {
+            assert!(
+                !busy(code).is_congestion(),
+                "{code} should not be congestion"
+            );
+        }
+        assert!(!Cause::StreamEndedUnexpectedly.is_congestion());
+        assert!(!Cause::IdleTimeout(Duration::from_secs(1)).is_congestion());
+        assert!(!Cause::Transport("reset".into()).is_congestion());
+        assert!(!Cause::MalformedFunctionCall.is_congestion());
     }
 
     #[test]

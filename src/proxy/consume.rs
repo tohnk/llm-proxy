@@ -9,7 +9,9 @@ use tokio::sync::mpsc::Sender;
 use tracing::{debug, trace, warn};
 
 use crate::config::Config;
-use crate::error::{AttemptOutcome, Cause};
+use crate::error::{
+    is_failed_generation_finish_reason, normalize_finish_reason, AttemptOutcome, Cause,
+};
 use crate::proxy::chunks::{
     build_chunk_with_content, build_chunk_with_reasoning, format_sse_data, parse_chunk_details,
     rewrite_upstream_chunk, UsageAccumulator,
@@ -342,7 +344,18 @@ pub async fn consume_upstream_stream(
 
     match finish_reason {
         Some(fr) => {
-            if fr == "tool_calls" && config.tools.buffer_tool_calls {
+            // §6.5: only the OpenAI-defined set reaches the client. Log whatever
+            // the upstream actually said, then forward the normalised value.
+            let normalized = normalize_finish_reason(&fr);
+            if normalized != fr {
+                debug!(
+                    upstream_finish_reason = %fr,
+                    normalized_finish_reason = %normalized,
+                    "Normalised a non-OpenAI finish reason"
+                );
+            }
+
+            if normalized == "tool_calls" && config.tools.buffer_tool_calls {
                 // Flush assembled tool calls chunk downstream before finish chunk
                 if let Some(tc_chunk) = tool_buffer.build_assembled_tool_calls_chunk(
                     state.downstream_id,
@@ -362,12 +375,18 @@ pub async fn consume_upstream_stream(
                 }
             }
 
-            if fr == "length" && config.resume.resume_on_length_finish {
-                *state.finish_reason = Some(fr);
+            if is_failed_generation_finish_reason(&fr) {
+                warn!(
+                    upstream_finish_reason = %fr,
+                    "Upstream reported a failed generation; retrying"
+                );
+                Ok(AttemptOutcome::Retryable(Cause::MalformedFunctionCall))
+            } else if normalized == "length" && config.resume.resume_on_length_finish {
+                *state.finish_reason = Some(normalized.to_string());
                 Ok(AttemptOutcome::Retryable(Cause::LengthFinishResumed))
             } else {
-                *state.finish_reason = Some(fr.clone());
-                Ok(AttemptOutcome::Terminal(fr))
+                *state.finish_reason = Some(normalized.to_string());
+                Ok(AttemptOutcome::Terminal(normalized.to_string()))
             }
         }
         None => {

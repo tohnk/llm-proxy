@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use rand::Rng;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use tracing::{error, info, info_span, trace, warn};
 use uuid::Uuid;
 
 use crate::config::{build_upstream_url, Config};
-use crate::error::{classify_http_response, AttemptOutcome, Cause};
+use crate::error::{classify_http_response, ApiError, AttemptOutcome, Cause};
 use crate::proxy::chunks::{
     build_chunk_with_finish, format_sse_comment, format_sse_data, format_sse_done, UsageAccumulator,
 };
@@ -68,7 +68,14 @@ pub async fn handle_streaming_request(
     let mut state = ResponseState::new(original_body);
     let _span = info_span!("chat_completions", downstream_id = %state.downstream_id);
 
-    let max_wall_clock = Duration::from_secs(config.resume.max_wall_clock_secs);
+    // Recomputed each attempt: the deadline depends on what has failed so far.
+    let mut congestion_failures: u32 = 0;
+    let mut other_failures: u32 = 0;
+    // The most recent upstream failure, surfaced at give-up if nothing was ever
+    // emitted downstream (§7).
+    let mut last_failure: Option<ApiError> = None;
+    // Assigned at the top of every attempt, before any use.
+    let mut max_wall_clock;
     let upstream_endpoint = build_upstream_url(&config.upstream.base_url, "chat/completions");
     let api_key = config.get_upstream_api_key();
 
@@ -102,24 +109,43 @@ pub async fn handle_streaming_request(
     );
 
     loop {
+        max_wall_clock = effective_wall_clock(
+            config.as_ref(),
+            congestion_failures > 0 && other_failures == 0,
+        );
+
         if state.attempt > config.resume.max_attempts
             || state.started_at.elapsed() >= max_wall_clock
         {
+            let emitted_chars = state.accumulated_text.chars().count();
             error!(
                 downstream_id = %state.downstream_id,
                 attempts = state.attempt - 1,
                 elapsed_secs = state.started_at.elapsed().as_secs(),
-                "Proxy gave up: max attempts or wall clock ceiling exhausted. Ending stream cleanly."
+                emitted_chars,
+                "Proxy gave up: max attempts or wall clock ceiling exhausted."
             );
-            // End downstream cleanly with stop without proxy error text in message body
-            let finish_chunk = build_chunk_with_finish(
-                &state.downstream_id,
-                state.created,
-                &state.model,
-                "stop",
-                Some(&state.usage),
-            );
-            let _ = downstream_tx.send(format_sse_data(&finish_chunk)).await;
+
+            // §7: a clean `stop` protects a partial answer from being corrupted
+            // by error text. With nothing emitted there is nothing to protect,
+            // and a silent empty response tells the user nothing at all — so the
+            // real upstream error goes out instead.
+            match (emitted_chars, last_failure.take()) {
+                (0, Some(api_err)) => {
+                    let err_chunk = api_err.to_openai_json();
+                    let _ = downstream_tx.send(format_sse_data(&err_chunk)).await;
+                }
+                _ => {
+                    let finish_chunk = build_chunk_with_finish(
+                        &state.downstream_id,
+                        state.created,
+                        &state.model,
+                        "stop",
+                        Some(&state.usage),
+                    );
+                    let _ = downstream_tx.send(format_sse_data(&finish_chunk)).await;
+                }
+            }
             let _ = downstream_tx.send(format_sse_done()).await;
             break;
         }
@@ -171,6 +197,8 @@ pub async fn handle_streaming_request(
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
                 let cause = Cause::Transport(e.to_string());
+                other_failures += 1;
+                last_failure = Some(ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()));
                 warn!(
                     downstream_id = %state.downstream_id,
                     attempt = state.attempt,
@@ -193,6 +221,11 @@ pub async fn handle_streaming_request(
                 continue;
             }
             Err(cause) => {
+                other_failures += 1;
+                last_failure = Some(ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    cause.to_string(),
+                ));
                 warn!(
                     downstream_id = %state.downstream_id,
                     attempt = state.attempt,
@@ -226,6 +259,8 @@ pub async fn handle_streaming_request(
             let body_text = match body_result {
                 Ok(Ok(body)) => body,
                 Ok(Err(e)) => {
+                    other_failures += 1;
+                    last_failure = Some(ApiError::new(status, e.to_string()));
                     warn!(
                         downstream_id = %state.downstream_id,
                         attempt = state.attempt,
@@ -242,6 +277,11 @@ pub async fn handle_streaming_request(
                     continue;
                 }
                 Err(_) => {
+                    other_failures += 1;
+                    last_failure = Some(ApiError::new(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Upstream error response exceeded wall-clock limit",
+                    ));
                     warn!(
                         downstream_id = %state.downstream_id,
                         attempt = state.attempt,
@@ -269,10 +309,17 @@ pub async fn handle_streaming_request(
 
             match outcome {
                 AttemptOutcome::Retryable(cause) => {
+                    if cause.is_congestion() {
+                        congestion_failures += 1;
+                    } else {
+                        other_failures += 1;
+                    }
+                    last_failure = Some(ApiError::from_status_and_body(status, &body_text));
                     warn!(
                         downstream_id = %state.downstream_id,
                         attempt = state.attempt,
                         status = %status,
+                        congestion = cause.is_congestion(),
                         "Upstream returned retryable HTTP status"
                     );
                     let backoff_dur =
@@ -370,12 +417,19 @@ pub async fn handle_streaming_request(
                     downstream_id = %state.downstream_id,
                     attempts = state.attempt,
                     total_duration_secs = state.started_at.elapsed().as_secs(),
+                    emitted_chars = state.accumulated_text.chars().count(),
                     finish_reason = %finish_reason,
                     "Streaming request completed successfully"
                 );
                 break;
             }
             AttemptOutcome::Retryable(cause) => {
+                if cause.is_congestion() {
+                    congestion_failures += 1;
+                } else {
+                    other_failures += 1;
+                }
+                last_failure = Some(ApiError::new(StatusCode::BAD_GATEWAY, cause.to_string()));
                 if ((!config.resume.enabled && attempt_had_meaningful_chunk)
                     || (disable_resume_for_tools && !state.accumulated_text.is_empty()))
                     || state.started_at.elapsed() >= max_wall_clock
@@ -445,6 +499,24 @@ pub async fn handle_streaming_request(
 /// and obeying it literally would spend the whole `max_attempts` budget in a
 /// handful of seconds while `max_wall_clock_secs` — the ceiling that actually
 /// governs how long a response may take — sits almost entirely unused.
+/// §7.3: how long the proxy may keep trying.
+///
+/// While every failure so far has been the upstream reporting congestion, the
+/// longer `overloaded_max_wall_clock_secs` applies — that condition clears on
+/// its own, and giving up early wastes a budget that was meant to absorb it.
+/// The moment any other kind of failure appears, the normal ceiling returns.
+/// Takes the larger of the two so the setting can only ever extend.
+pub fn effective_wall_clock(config: &Config, congestion_only: bool) -> Duration {
+    let normal = Duration::from_secs(config.resume.max_wall_clock_secs);
+    if congestion_only {
+        normal.max(Duration::from_secs(
+            config.resume.overloaded_max_wall_clock_secs,
+        ))
+    } else {
+        normal
+    }
+}
+
 pub fn calculate_backoff(config: &Config, attempt: u32, retry_after: Option<Duration>) -> Duration {
     let max_dur = Duration::from_millis(config.resume.backoff_max_ms);
 
@@ -503,6 +575,40 @@ async fn sleep_with_keepalive(duration: Duration, downstream_tx: &Sender<Bytes>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §7.3: the extended deadline applies only while congestion is the *only*
+    /// thing that has gone wrong, and it can never shorten the normal ceiling.
+    #[test]
+    fn test_effective_wall_clock_extends_only_for_congestion() {
+        let mut config = Config::default();
+        config.resume.max_wall_clock_secs = 240;
+        config.resume.overloaded_max_wall_clock_secs = 300;
+
+        assert_eq!(
+            effective_wall_clock(&config, true),
+            Duration::from_secs(300),
+            "congestion-only should use the extended ceiling"
+        );
+        assert_eq!(
+            effective_wall_clock(&config, false),
+            Duration::from_secs(240),
+            "any other failure returns the normal ceiling"
+        );
+
+        // Never shortens: a lower overloaded value is simply ignored.
+        config.resume.overloaded_max_wall_clock_secs = 60;
+        assert_eq!(
+            effective_wall_clock(&config, true),
+            Duration::from_secs(240)
+        );
+
+        // Shipped defaults: 900 normal already exceeds 300, so nothing changes.
+        let defaults = Config::default();
+        assert_eq!(
+            effective_wall_clock(&defaults, true),
+            effective_wall_clock(&defaults, false)
+        );
+    }
 
     #[test]
     fn test_calculate_backoff_no_jitter() {
