@@ -145,6 +145,10 @@ pub struct ResumeConfig {
     pub idle_timeout_secs: u64,
     #[serde(default)]
     pub resume_on_length_finish: bool,
+    /// Give up after this many consecutive attempts that fail the same way while
+    /// emitting nothing new (§7.5). Congestion is exempt. 0 disables the check.
+    #[serde(default = "default_max_no_progress_attempts")]
+    pub max_no_progress_attempts: u32,
 }
 
 fn default_true() -> bool {
@@ -180,6 +184,9 @@ fn default_first_chunk_timeout_secs() -> u64 {
 fn default_idle_timeout_secs() -> u64 {
     45
 }
+fn default_max_no_progress_attempts() -> u32 {
+    3
+}
 
 impl Default for ResumeConfig {
     fn default() -> Self {
@@ -197,6 +204,7 @@ impl Default for ResumeConfig {
             first_chunk_timeout_secs: default_first_chunk_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
             resume_on_length_finish: false,
+            max_no_progress_attempts: default_max_no_progress_attempts(),
         }
     }
 }
@@ -415,6 +423,13 @@ impl Config {
                 val,
             })?;
         }
+        if let Ok(val) = env::var("LLM_PROXY_RESUME_MAX_NO_PROGRESS_ATTEMPTS") {
+            self.resume.max_no_progress_attempts =
+                val.parse().map_err(|_| ConfigError::EnvOverride {
+                    key: "LLM_PROXY_RESUME_MAX_NO_PROGRESS_ATTEMPTS".to_string(),
+                    val,
+                })?;
+        }
         if let Ok(val) = env::var("LLM_PROXY_RESUME_RESUME_ON_LENGTH_FINISH") {
             self.resume.resume_on_length_finish =
                 parse_bool(&val).map_err(|_| ConfigError::EnvOverride {
@@ -524,6 +539,7 @@ mod tests {
         assert_eq!(config.resume.mode, ContinuationMode::Instructed);
         assert_eq!(config.resume.max_attempts, 6);
         assert_eq!(config.resume.dedup_window_chars, 240);
+        assert_eq!(config.resume.max_no_progress_attempts, 3);
         assert!(config.resume.enabled);
         assert!(config.tools.buffer_tool_calls);
     }
@@ -702,6 +718,7 @@ mod tests {
             ("LLM_PROXY_RESUME_DEDUP_WINDOW_CHARS", "999"),
             ("LLM_PROXY_RESUME_FIRST_CHUNK_TIMEOUT_SECS", "77"),
             ("LLM_PROXY_RESUME_IDLE_TIMEOUT_SECS", "13"),
+            ("LLM_PROXY_RESUME_MAX_NO_PROGRESS_ATTEMPTS", "7"),
             ("LLM_PROXY_RESUME_RESUME_ON_LENGTH_FINISH", "yes"),
             ("LLM_PROXY_TOOLS_BUFFER_TOOL_CALLS", "0"),
             ("LLM_PROXY_TOOLS_DISABLE_RESUME_FOR_TOOL_RESPONSES", "1"),
@@ -735,6 +752,7 @@ mod tests {
         assert_eq!(config.resume.dedup_window_chars, 999);
         assert_eq!(config.resume.first_chunk_timeout_secs, 77);
         assert_eq!(config.resume.idle_timeout_secs, 13);
+        assert_eq!(config.resume.max_no_progress_attempts, 7);
         assert!(config.resume.resume_on_length_finish);
 
         assert!(!config.tools.buffer_tool_calls);
@@ -767,6 +785,7 @@ mod tests {
             ("LLM_PROXY_RESUME_DEDUP_WINDOW_CHARS", "-5"),
             ("LLM_PROXY_RESUME_FIRST_CHUNK_TIMEOUT_SECS", "soon"),
             ("LLM_PROXY_RESUME_IDLE_TIMEOUT_SECS", "soon"),
+            ("LLM_PROXY_RESUME_MAX_NO_PROGRESS_ATTEMPTS", "thrice"),
             ("LLM_PROXY_RESUME_RESUME_ON_LENGTH_FINISH", "sometimes"),
             ("LLM_PROXY_TOOLS_BUFFER_TOOL_CALLS", "perhaps"),
             (

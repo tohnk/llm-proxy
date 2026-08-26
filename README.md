@@ -97,6 +97,7 @@ dedup_window_chars = 240
 first_chunk_timeout_secs = 120
 idle_timeout_secs = 45
 resume_on_length_finish = false
+max_no_progress_attempts = 3
 
 [tools]
 buffer_tool_calls = true

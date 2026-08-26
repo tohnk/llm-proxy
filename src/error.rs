@@ -40,6 +40,21 @@ impl Cause {
         }
     }
 
+    /// Stable label for the *kind* of failure, used to notice a cause that keeps
+    /// repeating. Deliberately coarse: transport messages vary in wording but
+    /// mean the same thing, and only the status matters for an HTTP failure.
+    pub fn label(&self) -> String {
+        match self {
+            Cause::HttpStatus { status, .. } => format!("http-{}", status.as_u16()),
+            Cause::Transport(_) => "transport".to_string(),
+            Cause::FirstChunkTimeout(_) => "first-chunk-timeout".to_string(),
+            Cause::IdleTimeout(_) => "idle-timeout".to_string(),
+            Cause::StreamEndedUnexpectedly => "stream-ended".to_string(),
+            Cause::LengthFinishResumed => "length-finish".to_string(),
+            Cause::MalformedFunctionCall => "malformed-function-call".to_string(),
+        }
+    }
+
     /// True when the upstream explicitly said "I am busy, come back later".
     ///
     /// 429 and 503 are the two statuses whose defined semantics are exactly

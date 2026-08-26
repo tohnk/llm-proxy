@@ -31,6 +31,7 @@ streaming responses survive transient upstream failures.
 > 9. Downstream `finish_reason` is **normalised** to the OpenAI set, and a finish reason
 >    reporting a failed generation is **retried** (§7.4).
 > 10. The wall clock **extends** while the upstream reports only congestion (§7.3).
+> 11. Retrying **stops early** when the same cause repeats without making progress (§7.5).
 >
 > §3.1 records the downstream-channel properties that any change to the streaming path must
 > preserve, independent of the payload type.
@@ -171,6 +172,7 @@ dedup_window_chars = 240            # see §6.3
 first_chunk_timeout_secs = 120      # timeout until first content, tool-call, or reasoning chunk
 idle_timeout_secs = 45              # no chunk for this long => treat as break
 resume_on_length_finish = false     # whether finish_reason "length" is treated as resumable
+max_no_progress_attempts = 3        # stop after this many identical, fruitless failures (§7.5)
 
 [tools]
 buffer_tool_calls = true            # assemble tool call fragments before emitting (§9)
@@ -361,6 +363,40 @@ shipped defaults (900 normal, 300 overloaded) it is inert, and it takes effect o
 
 Recommended pairing: set `max_attempts` high enough that it never binds and let the wall
 clock be the single governor.
+
+### 7.5 No-progress cutoff — *Amended (2026-08-24)*
+
+Retrying assumes the next attempt might differ. When it demonstrably does not, retrying
+converts a fast, legible failure into a slow one with the same outcome, and burns the
+user's time and the account's quota on the way.
+
+An attempt is **stalled** when it fails with the same `Cause` label as the previous attempt
+*and* emitted no new characters downstream. After `max_no_progress_attempts` consecutive
+stalled attempts, the proxy gives up and surfaces the error under the §7 give-up rules.
+
+Two exemptions keep this from firing on failures that are genuinely worth retrying:
+
+- **Congestion is transparent.** A 429 or 503 neither counts toward the limit nor clears a
+  run. It cannot emit content by definition, so counting it would cut off exactly the case
+  §7.3 exists to be patient with — but it is equally no evidence that some *other* failure
+  has changed, so it must not reset the count either. A degraded upstream interleaving 503s
+  with an identical fault would otherwise never reach the limit at all. Congestion remains
+  bounded by the wall clock alone.
+- **Progress resets the counter.** Repeated mid-stream cuts each advance `accumulated_text`,
+  so resumption is working and continues; only a run of attempts that achieve literally
+  nothing is stopped.
+
+A different cause also resets the run, since alternating failures indicate a genuinely
+unstable upstream rather than a deterministic one.
+
+**Motivating case.** Observed against Gemini with tools enabled: twelve attempts over 240 s,
+alternating 503s with `MALFORMED_FUNCTION_CALL`, `emitted_chars=0`. The malformed calls were
+identical every time — the failure was in the tool schema being sent, which no retry can
+change. Because the malformed failures were interleaved with 503s rather than consecutive, this
+only works if congestion is transparent rather than resetting: replaying that exact sequence,
+a resetting rule stops at attempt 12 (no better than the wall clock), while a transparent one
+stops at attempt 7 — the same error reaching the client either way, roughly three minutes
+sooner.
 
 ### 7.4 Finish-reason handling — *Amended (2026-08-21)*
 

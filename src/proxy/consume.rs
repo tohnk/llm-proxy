@@ -52,6 +52,22 @@ impl ActivityClock {
     }
 }
 
+/// The downstream client went away while an attempt was in flight.
+///
+/// A named type rather than `()` so the one failure mode this function has is
+/// legible at the call site — it is not an error to report upstream, it means
+/// abandon the request entirely (§11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientDisconnected;
+
+impl std::fmt::Display for ClientDisconnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "downstream client disconnected")
+    }
+}
+
+impl std::error::Error for ClientDisconnected {}
+
 pub struct StreamConsumerState<'a> {
     pub downstream_id: &'a str,
     pub created: i64,
@@ -77,7 +93,7 @@ pub async fn consume_upstream_stream(
     attempt: u32,
     timing: StreamTiming,
     downstream_tx: &Sender<Bytes>,
-) -> Result<AttemptOutcome, ()> {
+) -> Result<AttemptOutcome, ClientDisconnected> {
     // Every byte the upstream sends — heartbeat comments included — refreshes the
     // idle watchdog, even when it never becomes a dispatchable SSE event.
     let activity = ActivityClock::new(timing.attempt_started_at);
@@ -137,7 +153,7 @@ pub async fn consume_upstream_stream(
                     }
                     break 'watchdog Err(());
                 }
-                _ = downstream_tx.closed() => return Err(()),
+                _ = downstream_tx.closed() => return Err(ClientDisconnected),
             }
         };
 
@@ -236,7 +252,7 @@ pub async fn consume_upstream_stream(
                 .is_err()
             {
                 debug!("Downstream client disconnected while sending role chunk");
-                return Err(());
+                return Err(ClientDisconnected);
             }
         }
 
@@ -260,7 +276,7 @@ pub async fn consume_upstream_stream(
             if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
                 // Downstream client disconnected
                 debug!("Downstream client disconnected while sending reasoning");
-                return Err(());
+                return Err(ClientDisconnected);
             }
         }
 
@@ -285,7 +301,7 @@ pub async fn consume_upstream_stream(
                     .is_err()
                 {
                     debug!("Downstream client disconnected while sending tool call chunk");
-                    return Err(());
+                    return Err(ClientDisconnected);
                 }
             }
         }
@@ -308,7 +324,7 @@ pub async fn consume_upstream_stream(
 
                     if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
                         debug!("Downstream client disconnected while sending content chunk");
-                        return Err(());
+                        return Err(ClientDisconnected);
                     }
                 }
             }
@@ -329,7 +345,7 @@ pub async fn consume_upstream_stream(
 
         if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
             debug!("Downstream client disconnected during dedup flush");
-            return Err(());
+            return Err(ClientDisconnected);
         }
     }
 
@@ -370,7 +386,7 @@ pub async fn consume_upstream_stream(
                         .is_err()
                     {
                         debug!("Downstream client disconnected during tool calls flush");
-                        return Err(());
+                        return Err(ClientDisconnected);
                     }
                 }
             }

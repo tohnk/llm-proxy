@@ -59,6 +59,62 @@ impl ResponseState {
     }
 }
 
+/// Why attempts are failing, tracked across one downstream request.
+///
+/// Separates an upstream that is *busy* from one that is failing the same way
+/// forever. The former deserves patience (§7.3); the latter is not going to fix
+/// itself, and retrying it only converts a fast, clear failure into a slow one
+/// with the same outcome (§7.5).
+#[derive(Default)]
+struct FailureTracker {
+    congestion: u32,
+    other: u32,
+    last_label: Option<String>,
+    consecutive_stalled: u32,
+    last_failure: Option<ApiError>,
+}
+
+impl FailureTracker {
+    /// Record one failed attempt. `made_progress` is whether this attempt
+    /// emitted any new characters downstream.
+    fn record(&mut self, label: &str, is_congestion: bool, made_progress: bool, err: ApiError) {
+        if is_congestion {
+            self.congestion += 1;
+        } else {
+            self.other += 1;
+        }
+
+        // Congestion is transparent to the stall detector: it neither counts nor
+        // clears. "Busy, come back later" cannot emit content by definition, so
+        // counting it would cut off exactly the case §7.3 exists to be patient
+        // with — but it is also no evidence that the *other* failure has changed,
+        // so it must not reset a run either. A degraded upstream interleaving
+        // 503s with an identical fault would otherwise never reach the limit.
+        if !is_congestion {
+            if made_progress {
+                self.consecutive_stalled = 0;
+            } else if self.last_label.as_deref() == Some(label) {
+                self.consecutive_stalled += 1;
+            } else {
+                self.consecutive_stalled = 1;
+            }
+            self.last_label = Some(label.to_string());
+        }
+
+        self.last_failure = Some(err);
+    }
+
+    fn congestion_only(&self) -> bool {
+        self.congestion > 0 && self.other == 0
+    }
+
+    /// True once the same cause has failed `limit` times running without
+    /// emitting anything new. `limit == 0` disables the check.
+    fn is_stalled(&self, limit: u32) -> bool {
+        limit > 0 && self.consecutive_stalled >= limit
+    }
+}
+
 pub async fn handle_streaming_request(
     client: Client,
     config: Arc<Config>,
@@ -68,12 +124,9 @@ pub async fn handle_streaming_request(
     let mut state = ResponseState::new(original_body);
     let _span = info_span!("chat_completions", downstream_id = %state.downstream_id);
 
-    // Recomputed each attempt: the deadline depends on what has failed so far.
-    let mut congestion_failures: u32 = 0;
-    let mut other_failures: u32 = 0;
-    // The most recent upstream failure, surfaced at give-up if nothing was ever
-    // emitted downstream (§7).
-    let mut last_failure: Option<ApiError> = None;
+    // Drives both the deadline (§7.3) and the no-progress cutoff (§7.5), and
+    // holds the error surfaced at give-up if nothing was ever emitted (§7).
+    let mut failures = FailureTracker::default();
     // Assigned at the top of every attempt, before any use.
     let mut max_wall_clock;
     let upstream_endpoint = build_upstream_url(&config.upstream.base_url, "chat/completions");
@@ -109,28 +162,36 @@ pub async fn handle_streaming_request(
     );
 
     loop {
-        max_wall_clock = effective_wall_clock(
-            config.as_ref(),
-            congestion_failures > 0 && other_failures == 0,
-        );
+        max_wall_clock = effective_wall_clock(config.as_ref(), failures.congestion_only());
 
-        if state.attempt > config.resume.max_attempts
-            || state.started_at.elapsed() >= max_wall_clock
-        {
+        let stalled = failures.is_stalled(config.resume.max_no_progress_attempts);
+        let give_up_reason = if stalled {
+            Some("the same failure repeated with no progress")
+        } else if state.attempt > config.resume.max_attempts {
+            Some("max attempts exhausted")
+        } else if state.started_at.elapsed() >= max_wall_clock {
+            Some("wall clock ceiling exhausted")
+        } else {
+            None
+        };
+
+        if let Some(reason) = give_up_reason {
             let emitted_chars = state.accumulated_text.chars().count();
             error!(
                 downstream_id = %state.downstream_id,
                 attempts = state.attempt - 1,
                 elapsed_secs = state.started_at.elapsed().as_secs(),
                 emitted_chars,
-                "Proxy gave up: max attempts or wall clock ceiling exhausted."
+                repeated_cause = failures.last_label.as_deref().unwrap_or("none"),
+                reason,
+                "Proxy gave up"
             );
 
             // §7: a clean `stop` protects a partial answer from being corrupted
             // by error text. With nothing emitted there is nothing to protect,
             // and a silent empty response tells the user nothing at all — so the
             // real upstream error goes out instead.
-            match (emitted_chars, last_failure.take()) {
+            match (emitted_chars, failures.last_failure.take()) {
                 (0, Some(api_err)) => {
                     let err_chunk = api_err.to_openai_json();
                     let _ = downstream_tx.send(format_sse_data(&err_chunk)).await;
@@ -155,6 +216,8 @@ pub async fn handle_streaming_request(
             attempt = state.attempt,
             "Starting upstream attempt"
         );
+
+        let chars_before_attempt = state.accumulated_text.chars().count();
 
         let request_body = build_continuation_request(
             &state.original_body,
@@ -197,8 +260,12 @@ pub async fn handle_streaming_request(
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
                 let cause = Cause::Transport(e.to_string());
-                other_failures += 1;
-                last_failure = Some(ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()));
+                failures.record(
+                    &cause.label(),
+                    cause.is_congestion(),
+                    false,
+                    ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()),
+                );
                 warn!(
                     downstream_id = %state.downstream_id,
                     attempt = state.attempt,
@@ -221,11 +288,12 @@ pub async fn handle_streaming_request(
                 continue;
             }
             Err(cause) => {
-                other_failures += 1;
-                last_failure = Some(ApiError::new(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    cause.to_string(),
-                ));
+                failures.record(
+                    &cause.label(),
+                    cause.is_congestion(),
+                    false,
+                    ApiError::new(StatusCode::GATEWAY_TIMEOUT, cause.to_string()),
+                );
                 warn!(
                     downstream_id = %state.downstream_id,
                     attempt = state.attempt,
@@ -259,8 +327,12 @@ pub async fn handle_streaming_request(
             let body_text = match body_result {
                 Ok(Ok(body)) => body,
                 Ok(Err(e)) => {
-                    other_failures += 1;
-                    last_failure = Some(ApiError::new(status, e.to_string()));
+                    failures.record(
+                        "error-body-read",
+                        false,
+                        false,
+                        ApiError::new(status, e.to_string()),
+                    );
                     warn!(
                         downstream_id = %state.downstream_id,
                         attempt = state.attempt,
@@ -277,11 +349,15 @@ pub async fn handle_streaming_request(
                     continue;
                 }
                 Err(_) => {
-                    other_failures += 1;
-                    last_failure = Some(ApiError::new(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "Upstream error response exceeded wall-clock limit",
-                    ));
+                    failures.record(
+                        "error-body-timeout",
+                        false,
+                        false,
+                        ApiError::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "Upstream error response exceeded wall-clock limit",
+                        ),
+                    );
                     warn!(
                         downstream_id = %state.downstream_id,
                         attempt = state.attempt,
@@ -309,12 +385,12 @@ pub async fn handle_streaming_request(
 
             match outcome {
                 AttemptOutcome::Retryable(cause) => {
-                    if cause.is_congestion() {
-                        congestion_failures += 1;
-                    } else {
-                        other_failures += 1;
-                    }
-                    last_failure = Some(ApiError::from_status_and_body(status, &body_text));
+                    failures.record(
+                        &cause.label(),
+                        cause.is_congestion(),
+                        false,
+                        ApiError::from_status_and_body(status, &body_text),
+                    );
                     warn!(
                         downstream_id = %state.downstream_id,
                         attempt = state.attempt,
@@ -394,7 +470,7 @@ pub async fn handle_streaming_request(
         .await
         {
             Ok(out) => out,
-            Err(()) => {
+            Err(_disconnected) => {
                 // Downstream client disconnected
                 info!(downstream_id = %state.downstream_id, "Client disconnected; aborted upstream request");
                 return;
@@ -424,12 +500,12 @@ pub async fn handle_streaming_request(
                 break;
             }
             AttemptOutcome::Retryable(cause) => {
-                if cause.is_congestion() {
-                    congestion_failures += 1;
-                } else {
-                    other_failures += 1;
-                }
-                last_failure = Some(ApiError::new(StatusCode::BAD_GATEWAY, cause.to_string()));
+                failures.record(
+                    &cause.label(),
+                    cause.is_congestion(),
+                    state.accumulated_text.chars().count() > chars_before_attempt,
+                    ApiError::new(StatusCode::BAD_GATEWAY, cause.to_string()),
+                );
                 if ((!config.resume.enabled && attempt_had_meaningful_chunk)
                     || (disable_resume_for_tools && !state.accumulated_text.is_empty()))
                     || state.started_at.elapsed() >= max_wall_clock
@@ -575,6 +651,77 @@ async fn sleep_with_keepalive(duration: Duration, downstream_tx: &Sender<Bytes>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn err() -> ApiError {
+        ApiError::new(StatusCode::BAD_GATEWAY, "boom")
+    }
+
+    #[test]
+    fn test_failure_tracker_counts_repeats_without_progress() {
+        let mut t = FailureTracker::default();
+        for expected in 1..=3 {
+            t.record("malformed-function-call", false, false, err());
+            assert_eq!(t.consecutive_stalled, expected);
+        }
+        assert!(t.is_stalled(3));
+        assert!(!t.is_stalled(0), "limit 0 disables the check");
+    }
+
+    #[test]
+    fn test_failure_tracker_resets_on_progress_or_a_different_cause() {
+        let mut t = FailureTracker::default();
+        t.record("stream-ended", false, false, err());
+        t.record("stream-ended", false, false, err());
+        assert_eq!(t.consecutive_stalled, 2);
+
+        // An attempt that emitted new text is progress, however it ended.
+        t.record("stream-ended", false, true, err());
+        assert_eq!(t.consecutive_stalled, 0);
+        assert!(!t.is_stalled(3));
+
+        // A different failure starts a new run rather than continuing the old.
+        t.record("idle-timeout", false, false, err());
+        t.record("stream-ended", false, false, err());
+        assert_eq!(t.consecutive_stalled, 1);
+    }
+
+    /// Congestion cannot make content progress by definition, so counting it
+    /// would cut off exactly the case §7.3 exists to be patient with.
+    #[test]
+    fn test_failure_tracker_never_stalls_on_congestion() {
+        let mut t = FailureTracker::default();
+        for _ in 0..20 {
+            t.record("http-503", true, false, err());
+        }
+        assert_eq!(t.consecutive_stalled, 0);
+        assert!(!t.is_stalled(3));
+        assert!(t.congestion_only());
+
+        // ...but congestion must not *clear* a run either: it says nothing about
+        // whether the other failure has changed. This is the production sequence
+        // observed against Gemini — 503s interleaved with an identical fault.
+        let mut t = FailureTracker::default();
+        for (label, congestion) in [
+            ("http-503", true),
+            ("malformed-function-call", false),
+            ("malformed-function-call", false),
+            ("http-503", true),
+            ("http-503", true),
+            ("http-503", true),
+        ] {
+            t.record(label, congestion, false, err());
+            assert!(!t.is_stalled(3));
+        }
+        t.record("malformed-function-call", false, false, err());
+        assert!(
+            t.is_stalled(3),
+            "interleaved congestion must not hide a repeating fault"
+        );
+
+        // One non-congestion failure ends the extended deadline.
+        t.record("stream-ended", false, false, err());
+        assert!(!t.congestion_only());
+    }
 
     /// §7.3: the extended deadline applies only while congestion is the *only*
     /// thing that has gone wrong, and it can never shorten the normal ceiling.

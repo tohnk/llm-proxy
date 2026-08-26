@@ -2396,3 +2396,124 @@ async fn test_congestion_extends_the_deadline_but_other_failures_do_not() {
         "a non-congestion failure must not get the extended deadline, took {broken_elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// No-progress cutoff (§7.5)
+// ---------------------------------------------------------------------------
+
+// A cause that repeats identically while emitting nothing is not transient.
+// Retrying it only turns a fast failure into a slow one with the same outcome,
+// so the proxy stops after `max_no_progress_attempts`.
+#[tokio::test]
+async fn test_repeated_failure_with_no_progress_stops_early() {
+    let harness = TestHarness::setup(|config| {
+        // cut_after=0 with a finish reason emits the terminal chunk immediately:
+        // a failed generation carrying no content, exactly as observed from
+        // Gemini's MALFORMED_FUNCTION_CALL.
+        config.upstream.base_url = format!(
+            "{}/chat/completions?cut_after=0&finish_reason=function_call_filter:+MALFORMED_FUNCTION_CALL",
+            config.upstream.base_url
+        );
+        config.resume.max_attempts = 50;
+        config.resume.max_no_progress_attempts = 3;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        harness
+            .mock_state
+            .request_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "should stop at the no-progress limit, not run to max_attempts"
+    );
+    assert!(result.text.is_empty());
+    assert_eq!(result.errors.len(), 1, "the client must be told why");
+    assert_eq!(result.done_count, 1);
+}
+
+// Congestion is exempt: a busy upstream cannot emit content, and cutting it off
+// after three tries would defeat §7.3 entirely.
+#[tokio::test]
+async fn test_repeated_congestion_is_exempt_from_the_no_progress_cutoff() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!(
+            "{}/chat/completions?status=503&fail_first=1000",
+            config.upstream.base_url
+        );
+        config.resume.max_attempts = 8;
+        config.resume.max_no_progress_attempts = 3;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        harness
+            .mock_state
+            .request_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        8,
+        "503s should keep retrying to max_attempts, not stop at 3"
+    );
+    assert_eq!(result.done_count, 1);
+}
+
+// An attempt that emitted new text made progress, so the counter resets and
+// resumption continues — repeated mid-stream cuts must not be cut off at three.
+#[tokio::test]
+async fn test_progress_resets_the_no_progress_counter() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url =
+            format!("{}/chat/completions?cut_after=5", config.upstream.base_url);
+        config.resume.max_attempts = 6;
+        config.resume.max_no_progress_attempts = 3;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        harness
+            .mock_state
+            .request_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        6,
+        "each attempt advanced the response, so all attempts should be used"
+    );
+    assert!(
+        result.text.starts_with("Line 1\n"),
+        "partial content should still have been delivered"
+    );
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
