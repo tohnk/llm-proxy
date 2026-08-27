@@ -23,6 +23,13 @@ pub struct ResponseState {
     pub model: String,
     pub model_frozen: bool,
     pub accumulated_text: String,
+    /// Reasoning already shown to the client. Deduplicated across attempts like
+    /// content, but never included in continuation `messages` (§9).
+    pub accumulated_reasoning: String,
+    /// Payload frames delivered downstream across all attempts. Content is not
+    /// the only thing the client can have received, so give-up and no-progress
+    /// decisions key off this rather than `accumulated_text`.
+    pub emitted_payloads: u64,
     pub emitted_role: bool,
     pub attempt: u32,
     pub started_at: Instant,
@@ -50,6 +57,8 @@ impl ResponseState {
             model,
             model_frozen: false,
             accumulated_text: String::new(),
+            accumulated_reasoning: String::new(),
+            emitted_payloads: 0,
             emitted_role: false,
             attempt: 1,
             started_at: Instant::now(),
@@ -183,6 +192,7 @@ pub async fn handle_streaming_request(
                 attempts = state.attempt - 1,
                 elapsed_secs = state.started_at.elapsed().as_secs(),
                 emitted_chars,
+                emitted_payloads = state.emitted_payloads,
                 repeated_cause = failures.last_label.as_deref().unwrap_or("none"),
                 reason,
                 "Proxy gave up"
@@ -192,7 +202,11 @@ pub async fn handle_streaming_request(
             // by error text. With nothing emitted there is nothing to protect,
             // and a silent empty response tells the user nothing at all — so the
             // real upstream error goes out instead.
-            match (emitted_chars, failures.last_failure.take()) {
+            // Reasoning and passthrough tool deltas reach the client without
+            // touching `accumulated_text`, so "nothing was emitted" has to mean
+            // no payload at all — otherwise an error chunk gets appended to a
+            // response the user can already see.
+            match (state.emitted_payloads, failures.last_failure.take()) {
                 (0, Some(api_err)) => {
                     let err_chunk = api_err.to_openai_json();
                     let _ = downstream_tx.send(format_sse_data(&err_chunk)).await;
@@ -218,7 +232,7 @@ pub async fn handle_streaming_request(
             "Starting upstream attempt"
         );
 
-        let chars_before_attempt = state.accumulated_text.chars().count();
+        let payloads_before_attempt = state.emitted_payloads;
 
         let request_body = build_continuation_request(
             &state.original_body,
@@ -480,6 +494,8 @@ pub async fn handle_streaming_request(
             model: &mut state.model,
             model_frozen: &mut state.model_frozen,
             accumulated_text: &mut state.accumulated_text,
+            accumulated_reasoning: &mut state.accumulated_reasoning,
+            emitted_payloads: &mut state.emitted_payloads,
             emitted_role: &mut state.emitted_role,
             usage: &mut state.usage,
             finish_reason: &mut state.finish_reason,
@@ -525,6 +541,7 @@ pub async fn handle_streaming_request(
                     attempts = state.attempt,
                     total_duration_secs = state.started_at.elapsed().as_secs(),
                     emitted_chars = state.accumulated_text.chars().count(),
+                    emitted_payloads = state.emitted_payloads,
                     finish_reason = %finish_reason,
                     "Streaming request completed successfully"
                 );
@@ -534,7 +551,7 @@ pub async fn handle_streaming_request(
                 failures.record(
                     &cause.label(),
                     cause.is_congestion(),
-                    state.accumulated_text.chars().count() > chars_before_attempt,
+                    state.emitted_payloads > payloads_before_attempt,
                     ApiError::new(StatusCode::BAD_GATEWAY, cause.to_string()),
                 );
                 if ((!config.resume.enabled && attempt_had_meaningful_chunk)

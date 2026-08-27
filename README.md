@@ -78,6 +78,7 @@ Configuration is loaded from `--config <path>`, `$LLM_PROXY_CONFIG`, or defaults
 bind = "127.0.0.1:8787"
 max_body_bytes = 33554432           # 32 MiB (axum's 2 MiB default rejects long conversations)
 allowed_origins = []                # browser origins; empty means no CORS headers at all
+max_concurrent_requests = 64
 
 [upstream]
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"

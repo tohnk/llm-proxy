@@ -75,10 +75,39 @@ pub struct StreamConsumerState<'a> {
     pub model: &'a mut String,
     pub model_frozen: &'a mut bool,
     pub accumulated_text: &'a mut String,
+    /// Reasoning emitted downstream so far. Deduplicated like content (§9) but
+    /// deliberately excluded from continuation `messages`.
+    pub accumulated_reasoning: &'a mut String,
+    /// Count of payload frames sent downstream across all attempts. Content is
+    /// not the only thing a client can have received — reasoning and passthrough
+    /// tool deltas go out without touching `accumulated_text` — so decisions
+    /// about whether anything reached the client key off this instead.
+    pub emitted_payloads: &'a mut u64,
     pub emitted_role: &'a mut bool,
     pub usage: &'a mut UsageAccumulator,
     pub finish_reason: &'a mut Option<String>,
     pub attempt_had_meaningful_chunk: &'a mut bool,
+}
+
+/// Send one frame downstream, bounded by the request deadline.
+///
+/// A bounded channel plus a connected-but-unreading client is enough to defeat
+/// every other deadline: the transport buffer and the channel fill, `send`
+/// parks waiting for capacity, and the task holds its upstream connection open
+/// indefinitely. The deadlines wrap the *upstream* waits, not this one.
+async fn send_downstream(
+    downstream_tx: &Sender<Bytes>,
+    frame: Bytes,
+    deadline: Instant,
+) -> Result<(), ClientDisconnected> {
+    tokio::select! {
+        result = downstream_tx.send(frame) => result.map_err(|_| ClientDisconnected),
+        _ = downstream_tx.closed() => Err(ClientDisconnected),
+        _ = tokio::time::sleep_until(deadline.into()) => {
+            warn!("Downstream client stopped reading; abandoning the request");
+            Err(ClientDisconnected)
+        }
+    }
 }
 
 pub struct StreamTiming {
@@ -111,10 +140,16 @@ pub async fn consume_upstream_stream(
         config.resume.dedup_window_chars,
         attempt == 1,
     );
+    let mut reasoning_dedup = DedupBuffer::new(
+        state.accumulated_reasoning,
+        config.resume.dedup_window_chars,
+        attempt == 1,
+    );
     let mut tool_buffer = ToolCallsBuffer::new(config.tools.max_tool_call_bytes);
     let mut last_finish_reason: Option<String> = None;
     let mut seen_done = false;
 
+    let wall_clock_deadline = timing.request_started_at + timing.max_wall_clock;
     let first_timeout = Duration::from_secs(config.resume.first_chunk_timeout_secs);
     let idle_timeout = Duration::from_secs(config.resume.idle_timeout_secs);
 
@@ -123,7 +158,6 @@ pub async fn consume_upstream_stream(
         // The first-chunk deadline is fixed from dispatch (§8) and heartbeats do
         // not extend it; the idle deadline tracks the last upstream activity, so
         // a heartbeat pushes it out and the sleep is simply re-armed.
-        let wall_clock_deadline = timing.request_started_at + timing.max_wall_clock;
         let next_item = 'watchdog: loop {
             let in_first_chunk_phase =
                 !received_first_meaningful_chunk && last_finish_reason.is_none();
@@ -275,17 +309,24 @@ pub async fn consume_upstream_stream(
                 state.emitted_role,
                 false,
             );
-            if downstream_tx
-                .send(format_sse_data(&chunk_json))
-                .await
-                .is_err()
+            if send_downstream(
+                downstream_tx,
+                format_sse_data(&chunk_json),
+                wall_clock_deadline,
+            )
+            .await
+            .is_err()
             {
                 debug!("Downstream client disconnected while sending role chunk");
                 return Err(ClientDisconnected);
             }
         }
 
-        // Handle reasoning content (forward downstream directly, never append to accumulated_text)
+        // Reasoning is forwarded downstream but never appended to
+        // `accumulated_text`, so it never enters continuation `messages` (§9).
+        // It still needs its own overlap window: an attempt that fails after
+        // reasoning but before any content leaves `accumulated_text` empty, so
+        // the retry is a plain re-request and the upstream thinks aloud again.
         if let Some(reasoning) = details.reasoning {
             received_first_meaningful_chunk = true;
             *state.attempt_had_meaningful_chunk = true;
@@ -293,19 +334,37 @@ pub async fn consume_upstream_stream(
                 .reasoning_field
                 .as_deref()
                 .unwrap_or("reasoning_content");
-            let chunk = build_chunk_with_reasoning(
-                state.downstream_id,
-                state.created,
-                state.model,
-                &reasoning,
-                reasoning_field,
-                !*state.emitted_role,
-            );
-            *state.emitted_role = true;
-            if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
-                // Downstream client disconnected
-                debug!("Downstream client disconnected while sending reasoning");
-                return Err(ClientDisconnected);
+
+            if let Some(text) = reasoning_dedup.push_delta(&reasoning) {
+                if !text.is_empty() {
+                    if state.accumulated_reasoning.len().saturating_add(text.len())
+                        > config.resume.max_accumulated_bytes
+                    {
+                        warn!(
+                            limit = config.resume.max_accumulated_bytes,
+                            "Accumulated reasoning hit the configured size limit; ending the stream"
+                        );
+                        return Ok(AttemptOutcome::Terminal("length".to_string()));
+                    }
+                    state.accumulated_reasoning.push_str(&text);
+                    let chunk = build_chunk_with_reasoning(
+                        state.downstream_id,
+                        state.created,
+                        state.model,
+                        &text,
+                        reasoning_field,
+                        !*state.emitted_role,
+                    );
+                    *state.emitted_role = true;
+                    if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+                        .await
+                        .is_err()
+                    {
+                        debug!("Downstream client disconnected while sending reasoning");
+                        return Err(ClientDisconnected);
+                    }
+                    *state.emitted_payloads += 1;
+                }
             }
         }
 
@@ -324,10 +383,14 @@ pub async fn consume_upstream_stream(
                     !*state.emitted_role,
                 );
                 *state.emitted_role = true;
-                if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
+                if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+                    .await
+                    .is_err()
+                {
                     debug!("Downstream client disconnected while sending tool call chunk");
                     return Err(ClientDisconnected);
                 }
+                *state.emitted_payloads += 1;
             }
         }
 
@@ -359,10 +422,14 @@ pub async fn consume_upstream_stream(
                     );
                     *state.emitted_role = true;
 
-                    if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
+                    if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+                        .await
+                        .is_err()
+                    {
                         debug!("Downstream client disconnected while sending content chunk");
                         return Err(ClientDisconnected);
                     }
+                    *state.emitted_payloads += 1;
                 }
             }
         }
@@ -380,10 +447,36 @@ pub async fn consume_upstream_stream(
         );
         *state.emitted_role = true;
 
-        if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
+        if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+            .await
+            .is_err()
+        {
             debug!("Downstream client disconnected during dedup flush");
             return Err(ClientDisconnected);
         }
+        *state.emitted_payloads += 1;
+    }
+
+    // Flush any reasoning still held behind its overlap window.
+    if let Some(text) = reasoning_dedup.finish() {
+        state.accumulated_reasoning.push_str(&text);
+        let chunk = build_chunk_with_reasoning(
+            state.downstream_id,
+            state.created,
+            state.model,
+            &text,
+            "reasoning_content",
+            !*state.emitted_role,
+        );
+        *state.emitted_role = true;
+        if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+            .await
+            .is_err()
+        {
+            debug!("Downstream client disconnected during reasoning flush");
+            return Err(ClientDisconnected);
+        }
+        *state.emitted_payloads += 1;
     }
 
     // Check finish reason
@@ -436,14 +529,18 @@ pub async fn consume_upstream_stream(
                     !*state.emitted_role,
                 ) {
                     *state.emitted_role = true;
-                    if downstream_tx
-                        .send(format_sse_data(&tc_chunk))
-                        .await
-                        .is_err()
+                    if send_downstream(
+                        downstream_tx,
+                        format_sse_data(&tc_chunk),
+                        wall_clock_deadline,
+                    )
+                    .await
+                    .is_err()
                     {
                         debug!("Downstream client disconnected during tool calls flush");
                         return Err(ClientDisconnected);
                     }
+                    *state.emitted_payloads += 1;
                 }
             }
 

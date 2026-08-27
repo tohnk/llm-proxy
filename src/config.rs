@@ -69,6 +69,12 @@ pub struct ServerConfig {
     /// configured account's quota through your loopback listener.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Chat completions handled at once. Beyond this, requests are refused with
+    /// 503 rather than queued: each in-flight request holds an upstream
+    /// connection and up to `max_accumulated_bytes` of state, so unbounded
+    /// admission turns a burst into memory exhaustion.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
 }
 
 fn default_bind() -> String {
@@ -78,6 +84,9 @@ fn default_bind() -> String {
 fn default_max_body_bytes() -> usize {
     32 * 1024 * 1024
 }
+fn default_max_concurrent_requests() -> usize {
+    64
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -85,6 +94,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             max_body_bytes: default_max_body_bytes(),
             allowed_origins: Vec::new(),
+            max_concurrent_requests: default_max_concurrent_requests(),
         }
     }
 }
@@ -395,6 +405,13 @@ impl Config {
         }
         if let Ok(val) = env::var("LLM_PROXY_UPSTREAM_API_KEY") {
             self.upstream.api_key = Some(val);
+        }
+        if let Ok(val) = env::var("LLM_PROXY_SERVER_MAX_CONCURRENT_REQUESTS") {
+            self.server.max_concurrent_requests =
+                val.parse().map_err(|_| ConfigError::EnvOverride {
+                    key: "LLM_PROXY_SERVER_MAX_CONCURRENT_REQUESTS".to_string(),
+                    val,
+                })?;
         }
         if let Ok(val) = env::var("LLM_PROXY_SERVER_ALLOWED_ORIGINS") {
             self.server.allowed_origins = val

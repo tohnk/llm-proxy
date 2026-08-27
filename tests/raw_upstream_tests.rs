@@ -1402,3 +1402,247 @@ async fn test_disable_resume_for_tool_responses_after_text() {
     assert_eq!(enabled_requests, 2, "control: resumption should proceed");
     assert_eq!(enabled.text, default_corpus());
 }
+
+// ---------------------------------------------------------------------------
+// Reasoning continuity, emission accounting, admission control
+// ---------------------------------------------------------------------------
+
+/// §9: reasoning is forwarded but excluded from continuation `messages`, so an
+/// attempt that dies after reasoning and before content leaves
+/// `accumulated_text` empty — the retry is a plain re-request and the upstream
+/// thinks aloud again. Reasoning needs its own overlap window.
+#[tokio::test]
+async fn test_reasoning_is_not_duplicated_across_a_retry() {
+    let upstream = spawn_raw_upstream(|req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let think = |text: &str, role: bool| {
+                let mut delta = serde_json::Map::new();
+                if role {
+                    delta.insert("role".into(), json!("assistant"));
+                }
+                delta.insert("reasoning_content".into(), json!(text));
+                json!({
+                    "id": "upstream-raw",
+                    "object": "chat.completion.chunk",
+                    "created": 1690000000,
+                    "model": "raw-mock-model",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}]
+                })
+            };
+
+            // Both attempts think the same thoughts; only the second gets to
+            // any visible content.
+            write_sse(&mut sock, &think("Step one. ", true)).await;
+            write_sse(&mut sock, &think("Step two. ", false)).await;
+
+            if req.num == 1 {
+                truncate_mid_chunk(sock).await;
+            } else {
+                write_sse(&mut sock, &content_chunk("Answer.", false)).await;
+                write_sse(&mut sock, &finish_chunk("stop")).await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            }
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |config| {
+        config.resume.dedup_window_chars = 8;
+    })
+    .await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(upstream.requests(), 2);
+    assert_eq!(
+        result.reasoning, "Step one. Step two. ",
+        "reasoning was replayed to the client"
+    );
+    assert_eq!(result.text, "Answer.");
+    assert_eq!(result.done_count, 1);
+}
+
+/// §7 give-up: reasoning reaches the client without touching `accumulated_text`,
+/// so "nothing was emitted" must mean no payload at all. Otherwise an error
+/// chunk is appended to a response the user can already see.
+#[tokio::test]
+async fn test_give_up_after_reasoning_only_does_not_append_an_error() {
+    let upstream = spawn_raw_upstream(|_req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let mut delta = serde_json::Map::new();
+            delta.insert("role".into(), json!("assistant"));
+            delta.insert("reasoning_content".into(), json!("Thinking hard. "));
+            write_sse(
+                &mut sock,
+                &json!({
+                    "id": "upstream-raw",
+                    "object": "chat.completion.chunk",
+                    "created": 1690000000,
+                    "model": "raw-mock-model",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}]
+                }),
+            )
+            .await;
+            truncate_mid_chunk(sock).await;
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |config| {
+        config.resume.max_attempts = 2;
+        config.resume.max_no_progress_attempts = 0;
+    })
+    .await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert!(
+        !result.reasoning.is_empty(),
+        "reasoning did reach the client"
+    );
+    assert!(
+        result.errors.is_empty(),
+        "an error must not be appended after real output: {:?}",
+        result.errors
+    );
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+/// §4: admission control refuses rather than queues once the limit is reached.
+#[tokio::test]
+async fn test_concurrency_limit_refuses_excess_requests() {
+    let upstream = spawn_raw_upstream(|_req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            // Hold the stream open so the first request keeps its permit.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            write_sse(&mut sock, &finish_chunk("stop")).await;
+            write_done(&mut sock).await;
+            end_stream_cleanly(&mut sock).await;
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |config| {
+        config.server.max_concurrent_requests = 1;
+        config.resume.first_chunk_timeout_secs = 30;
+        config.resume.idle_timeout_secs = 30;
+    })
+    .await;
+
+    let client = test_client();
+    let first = client
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&chat_body())
+        .send()
+        .await
+        .expect("first request should be admitted");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let second = client
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&chat_body())
+        .send()
+        .await
+        .expect("second request should get a response, not hang");
+
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "the second request should be refused while the first holds the permit"
+    );
+    let body: Value = second.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("concurrency limit"));
+
+    // The permit is released when the first request finishes.
+    drop(first);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let third = client
+        .post(format!("http://{proxy}/v1/chat/completions"))
+        .json(&chat_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        third.status(),
+        reqwest::StatusCode::OK,
+        "the permit should be released once the request completes"
+    );
+}
+
+/// §11 / M2: a client that stays connected but stops reading fills the socket
+/// buffers and then the channel, parking `send` forever. The upstream deadlines
+/// wrap the *upstream* waits, so without bounding the send too, the task and its
+/// upstream connection are retained indefinitely.
+#[tokio::test]
+async fn test_client_that_stops_reading_is_abandoned_at_the_deadline() {
+    let closed_after_ms = Arc::new(AtomicU64::new(NEVER_CLOSED));
+    let recorder = Arc::clone(&closed_after_ms);
+
+    let upstream = spawn_raw_upstream(move |_req, mut sock| {
+        let recorder = Arc::clone(&recorder);
+        Box::pin(async move {
+            let started = Instant::now();
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+
+            // Push hard enough to fill the downstream socket buffers and then
+            // the proxy's channel.
+            for i in 0..100_000 {
+                let payload = format!(
+                    "data: {}\n\n",
+                    content_chunk(&format!("chunk {i} padding padding padding "), i == 0)
+                );
+                let framed = format!("{:x}\r\n{}\r\n", payload.len(), payload);
+                if sock.write_all(framed.as_bytes()).await.is_err() {
+                    recorder.store(started.elapsed().as_millis() as u64, Ordering::SeqCst);
+                    return;
+                }
+                if started.elapsed() > Duration::from_secs(20) {
+                    return;
+                }
+            }
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |config| {
+        config.resume.max_wall_clock_secs = 2;
+        config.resume.first_chunk_timeout_secs = 20;
+        config.resume.idle_timeout_secs = 20;
+        config.resume.max_attempts = 1;
+        config.resume.max_accumulated_bytes = usize::MAX;
+    })
+    .await;
+
+    // A raw client: send the request, read the response head, then stop reading
+    // while keeping the connection open.
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    let body = chat_body().to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {proxy}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut head = [0u8; 256];
+    let _ = client.read(&mut head).await.unwrap();
+
+    // Hold the socket open, reading nothing.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    drop(client);
+
+    let closed = closed_after_ms.load(Ordering::SeqCst);
+    assert_ne!(
+        closed, NEVER_CLOSED,
+        "the upstream connection was retained by a client that stopped reading"
+    );
+    assert!(
+        closed < 5_000,
+        "abandonment took {closed}ms; the send should be bounded by the wall clock"
+    );
+}

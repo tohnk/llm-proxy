@@ -19,7 +19,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 use tracing::{error, warn};
@@ -34,6 +34,9 @@ use crate::proxy::stream::{calculate_backoff, handle_streaming_request};
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: Client,
+    /// Admission control for chat completions (§4). Held for the whole life of
+    /// a request, including the spawned streaming task.
+    pub limiter: Arc<Semaphore>,
 }
 
 pub fn create_app(config: Arc<Config>) -> Router {
@@ -45,7 +48,12 @@ pub fn create_app(config: Arc<Config>) -> Router {
 
     let max_body_bytes = config.server.max_body_bytes;
     let allowed_origins = config.server.allowed_origins.clone();
-    let state = AppState { config, client };
+    let limiter = Arc::new(Semaphore::new(config.server.max_concurrent_requests.max(1)));
+    let state = AppState {
+        config,
+        client,
+        limiter,
+    };
 
     let mut router = Router::new()
         .route("/health", get(health_handler))
@@ -218,6 +226,26 @@ async fn chat_completions_handler(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
+    // Refuse rather than queue: a queued request still holds its parsed body and
+    // waits behind work that may run for the full wall clock.
+    let permit = match Arc::clone(&state.limiter).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("Refusing request: concurrency limit reached");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Proxy is at its configured concurrency limit",
+                    )
+                    .to_openai_json(),
+                ),
+            )
+                .into_response();
+        }
+    };
+
     let is_streaming = body
         .get("stream")
         .and_then(|s| s.as_bool())
@@ -225,12 +253,13 @@ async fn chat_completions_handler(
 
     if is_streaming {
         let (tx, rx) = mpsc::channel::<Bytes>(64);
-        tokio::spawn(handle_streaming_request(
-            state.client.clone(),
-            state.config.clone(),
-            body,
-            tx,
-        ));
+        let client = state.client.clone();
+        let config = state.config.clone();
+        tokio::spawn(async move {
+            // The permit lives as long as the work it admits.
+            let _permit = permit;
+            handle_streaming_request(client, config, body, tx).await;
+        });
 
         let stream = ReceiverStream::new(rx).map(Ok::<_, Infallible>);
 
@@ -257,6 +286,9 @@ async fn chat_completions_handler(
                     .into_response()
             })
     } else {
-        handle_nonstreaming_request(state.client.clone(), state.config.clone(), body).await
+        let response =
+            handle_nonstreaming_request(state.client.clone(), state.config.clone(), body).await;
+        drop(permit);
+        response
     }
 }

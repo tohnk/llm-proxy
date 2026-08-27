@@ -7,6 +7,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Bump Homebrew Formula
+        # TODO: pin to a full commit SHA. This step receives a tap token, and a
+        # mutable tag means whoever can move `v4` can run arbitrary code with
+        # that token. Resolve and pin with:
+        #   gh api repos/mislav/bump-homebrew-formula-action/git/ref/tags/v4 --jq .object.sha
+        # then replace the tag below with `@<sha>  # v4`.
         uses: mislav/bump-homebrew-formula-action@v4
         with:
           formula-name: llm-proxy

@@ -41,6 +41,9 @@ streaming responses survive transient upstream failures.
 > 16. CORS is **closed by default**; browser origins must be listed explicitly (§4).
 > 17. Dedup detects a **full upstream restart** via a head window, not only a tail one (§6.3).
 > 18. Upstream output and accumulated state are **byte-bounded** (§4).
+> 19. Reasoning is **deduplicated** across attempts, and "nothing emitted" counts every
+>     payload, not only content (§9, §7).
+> 20. Downstream sends are **deadline-bounded**, and admission is **capped** (§4, §11).
 >
 > §3.1 records the downstream-channel properties that any change to the streaming path must
 > preserve, independent of the payload type.
@@ -161,6 +164,7 @@ TOML file, path from `--config` or `$LLM_PROXY_CONFIG`, defaulting to
 bind = "127.0.0.1:8787"
 max_body_bytes = 33554432           # 32 MiB; see §5 — axum's 2 MiB default rejects long chats
 allowed_origins = []                # browser origins; empty = no CORS headers at all
+max_concurrent_requests = 64        # chat completions in flight; beyond this, 503 (§4)
 
 [upstream]
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -388,6 +392,13 @@ enum AttemptOutcome {
 
 **`resume.enabled = false` Semantics:** If `resume.enabled = false`, mid-stream failures do not attempt continuation; the stream terminates cleanly with a `stop` chunk. Initial pre-stream transient errors (e.g. initial 429/503 before any chunk) still follow normal retry up to `max_attempts`.
 
+**Emission accounting — *Amended (2026-08-24)*.** "Nothing was emitted" means *no payload
+frame reached the client*, counted across content, reasoning, and passthrough tool deltas —
+not merely that `accumulated_text` is empty. Reasoning and unbuffered tool output reach the
+client without touching `accumulated_text`, so keying off content alone would append an error
+chunk to a response the user can already see, and would let the no-progress cutoff (§7.5)
+stop a request that is visibly producing output.
+
 **Give-up behaviour — *Amended (2026-08-21)*:** When attempts or wall clock are exhausted,
 log at error level, then terminate the downstream stream in one of two ways:
 
@@ -602,6 +613,12 @@ deadline is clamped to it.
     replacement, two calls for one intended invocation.
 - **Tool Call Passthrough (`buffer_tool_calls = false`):** Emit tool call deltas as they arrive, rewriting IDs and suppressing intermediate finish reasons. ***Amended (2026-08-24)*:** emit a chunk containing *only* the tool calls rather than forwarding the upstream object verbatim. A single upstream event may carry `content` and `reasoning` alongside `tool_calls`, and those are emitted by their own branches; forwarding the mixed source object sends them twice. Note that passthrough has **no equivalent of the §6.3 overlap window**: fragments already forwarded by an attempt that later fails cannot be recalled, so a cut mid-tool-call leaves the client holding the abandoned fragment as well as the complete retry. Buffering (the default) does not have this problem, because nothing is emitted until the call is whole.
 - **Reasoning / Thinking content:** Forward `delta.reasoning_content` / `delta.reasoning` downstream immediately, but **exclude from `accumulated_text` and continuation `messages`**.
+  - ***Amended (2026-08-24)*:** reasoning gets its **own overlap window**, held in
+    `accumulated_reasoning`. Excluding it from `accumulated_text` means an attempt that dies
+    after reasoning but before any content leaves the continuation empty, so the retry is a
+    plain re-request and the upstream thinks aloud again — the client sees the reasoning
+    twice. Deduplicating it separately preserves the §9 rule (it still never enters
+    continuation `messages`) while keeping the visible stream continuous.
 - **`disable_resume_for_tool_responses = true`:** Requests with a `tools` array skip resumption if a failure occurs after text/content has begun emitting.
 
 ---
@@ -615,6 +632,19 @@ deadline is clamped to it.
 ## 11. Client disconnect
 
 When the downstream client disconnects (detected via mpsc channel send failure), immediately abort in-flight upstream requests and cleanly terminate the spawned task.
+
+**Clients that stop reading — *Amended (2026-08-24)*.** Disconnection is not the only way a
+client stops consuming. One that stays connected but never reads fills the socket buffers and
+then the bounded channel, at which point `send` parks waiting for capacity — and every other
+deadline wraps an *upstream* wait, not that one, so the task and its upstream connection are
+retained indefinitely. Every downstream send is therefore bounded by the request deadline as
+well as by channel closure; exceeding it abandons the request exactly as a disconnect does.
+
+**Admission control — *Amended (2026-08-24)*.** At most
+`server.max_concurrent_requests` chat completions run at once. Excess requests are refused
+with `503` rather than queued: a queued request still holds its parsed body and waits behind
+work that may run for the full wall clock. Each admitted request holds its permit for the
+whole of its life, including the spawned streaming task.
 
 ---
 

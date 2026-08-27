@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Several tests are timing-sensitive (backoff escalation, idle and
+      # first-chunk watchdogs, disconnect propagation). A single green run is
+      # weak evidence on shared CI runners, so the suite runs twice.
+      - name: Tests
+        run: cargo test --locked --all-targets
+
+      - name: Tests (repeat, to catch timing flakes)
+        run: cargo test --locked --all-targets
+
+      - name: Release build
+        run: cargo build --locked --release --bins
