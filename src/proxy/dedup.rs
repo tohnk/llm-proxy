@@ -36,12 +36,39 @@ pub fn deduplicate(accumulated_text: &str, pending: &str, window_chars: usize) -
     (overlap, remaining_chars)
 }
 
-/// State helper for buffering and deduplicating chunks during a retry attempt.
+/// Which strategy the current retry attempt is resolving under.
+#[derive(Debug, PartialEq, Eq)]
+enum Phase {
+    /// First attempt, or dedup already resolved: forward everything.
+    Passthrough,
+    /// Collecting the first window to decide restart vs. continuation.
+    Deciding,
+    /// A full restart was detected; consuming the replayed prefix.
+    SkippingReplay,
+}
+
+/// Buffers and deduplicates the opening of a resumed attempt.
+///
+/// Two distinct upstream behaviours have to be handled, and §6.3's tail window
+/// only covers one of them:
+///
+/// - **Continuation** — the upstream carries on from where it stopped, possibly
+///   repeating a little. The overlap sits between the *end* of what was already
+///   emitted and the *start* of the retry, so a tail window finds it.
+/// - **Full restart** — the upstream ignores the prefix and generates the whole
+///   response again. If more than `window_chars` had been emitted, the retry's
+///   opening no longer overlaps the tail at all and every previously emitted
+///   character would be sent a second time.
+///
+/// A *head* window separates the two cheaply: if the retry's first
+/// `window_chars` match the first `window_chars` already emitted, it is a
+/// restart, and the replayed prefix is consumed before forwarding resumes.
+/// Continuation is unaffected and still emits after one window.
 pub struct DedupBuffer {
     window_chars: usize,
-    accumulated_tail: Vec<char>,
+    accumulated: Vec<char>,
     pending: String,
-    dedup_done: bool,
+    phase: Phase,
 }
 
 impl DedupBuffer {
@@ -49,70 +76,117 @@ impl DedupBuffer {
         if is_first_attempt {
             Self {
                 window_chars,
-                accumulated_tail: Vec::new(),
+                accumulated: Vec::new(),
                 pending: String::new(),
-                dedup_done: true,
+                phase: Phase::Passthrough,
             }
         } else {
-            // Walk back from the end rather than materialising the whole
-            // accumulated response: only the last `window_chars` are ever read,
-            // and by a late retry the accumulated text can be very large.
-            let mut tail: Vec<char> = accumulated_text.chars().rev().take(window_chars).collect();
-            tail.reverse();
-
             Self {
                 window_chars,
-                accumulated_tail: tail,
+                accumulated: accumulated_text.chars().collect(),
                 pending: String::new(),
-                dedup_done: false,
+                phase: Phase::Deciding,
             }
         }
     }
 
     /// Process an incoming content delta.
-    /// Returns `Some(text_to_forward)` if text is ready to be emitted downstream, or `None` if buffering.
+    /// Returns `Some(text_to_forward)` when text is ready, or `None` while buffering.
     pub fn push_delta(&mut self, delta: &str) -> Option<String> {
-        if self.dedup_done {
-            if delta.is_empty() {
-                None
-            } else {
-                Some(delta.to_string())
+        match self.phase {
+            Phase::Passthrough => {
+                if delta.is_empty() {
+                    None
+                } else {
+                    Some(delta.to_string())
+                }
             }
-        } else {
-            self.pending.push_str(delta);
-            if self.pending.chars().count() >= self.window_chars {
-                Some(self.perform_dedup())
-            } else {
-                None
+            Phase::Deciding => {
+                self.pending.push_str(delta);
+                let pending: Vec<char> = self.pending.chars().collect();
+
+                if self.accumulated.is_empty() {
+                    return Some(self.resolve(pending, false));
+                }
+
+                let probe = self.window_chars.min(self.accumulated.len());
+                if pending.len() < probe {
+                    return None;
+                }
+
+                if pending[..probe] == self.accumulated[..probe] {
+                    // The retry is replaying from the beginning.
+                    if pending.len() < self.accumulated.len() {
+                        self.phase = Phase::SkippingReplay;
+                        return None;
+                    }
+                    return Some(self.resolve(pending, true));
+                }
+
+                Some(self.resolve(pending, false))
+            }
+            Phase::SkippingReplay => {
+                self.pending.push_str(delta);
+                let pending: Vec<char> = self.pending.chars().collect();
+                if pending.len() < self.accumulated.len() {
+                    return None;
+                }
+                Some(self.resolve(pending, true))
             }
         }
     }
 
-    /// Flush any pending text when the upstream stream ends.
+    /// Flush whatever is buffered when the upstream stream ends.
     pub fn finish(&mut self) -> Option<String> {
-        if !self.dedup_done {
-            let out = self.perform_dedup();
-            if out.is_empty() {
-                None
-            } else {
-                Some(out)
-            }
-        } else {
+        if self.phase == Phase::Passthrough {
+            return None;
+        }
+        let pending: Vec<char> = self.pending.chars().collect();
+
+        // A restart that died partway through its replay produced nothing new.
+        if !pending.is_empty()
+            && pending.len() < self.accumulated.len()
+            && self.accumulated.starts_with(&pending)
+        {
+            self.phase = Phase::Passthrough;
+            self.pending.clear();
+            debug!(
+                replayed_chars = pending.len(),
+                "Retry replayed a prefix and ended; nothing new to forward"
+            );
+            return None;
+        }
+
+        let replayed =
+            pending.len() >= self.accumulated.len() && pending.starts_with(&self.accumulated[..]);
+        let out = self.resolve(pending, replayed);
+        if out.is_empty() {
             None
+        } else {
+            Some(out)
         }
     }
 
-    fn perform_dedup(&mut self) -> String {
-        self.dedup_done = true;
-        let pending_chars: Vec<char> = self.pending.chars().collect();
-        let overlap = find_overlap_chars(&self.accumulated_tail, &pending_chars);
+    /// Settle this attempt's overlap and return the text to forward.
+    fn resolve(&mut self, pending: Vec<char>, full_replay: bool) -> String {
+        self.phase = Phase::Passthrough;
+        self.pending.clear();
+
+        if full_replay && pending.starts_with(&self.accumulated[..]) {
+            debug!(
+                replayed_chars = self.accumulated.len(),
+                "Upstream restarted from the beginning; dropped the replayed prefix"
+            );
+            return pending[self.accumulated.len()..].iter().collect();
+        }
+
+        let tail_start = self.accumulated.len().saturating_sub(self.window_chars);
+        let overlap = find_overlap_chars(&self.accumulated[tail_start..], &pending);
         debug!(
             overlap_chars = overlap,
             "Dedup evaluated on retry continuation"
         );
-        let remaining: String = pending_chars[overlap..].iter().collect();
-        self.pending.clear();
-        remaining
+        pending[overlap..].iter().collect()
     }
 }
 
@@ -194,11 +268,76 @@ mod tests {
         assert_eq!(buf.push_delta(", 9"), Some(", 9".to_string()));
     }
 
+    /// The case the tail window alone cannot see: more than `window_chars` were
+    /// emitted, and the retry starts the whole response again.
     #[test]
-    fn test_dedup_buffer_retry_attempt_finish_before_window() {
-        let accumulated = "Hello ";
-        let mut buf = DedupBuffer::new(accumulated, 50, false);
-        assert_eq!(buf.push_delta("Hello world"), None);
-        assert_eq!(buf.finish(), Some("world".to_string()));
+    fn test_dedup_buffer_detects_restart_beyond_the_window() {
+        let accumulated: String = (1..=60).map(|i| format!("Line {i}\n")).collect();
+        assert!(accumulated.chars().count() > 240);
+
+        let mut buf = DedupBuffer::new(&accumulated, 240, false);
+
+        // The upstream replays everything, then continues.
+        let mut emitted = String::new();
+        for i in 1..=60 {
+            if let Some(out) = buf.push_delta(&format!("Line {i}\n")) {
+                emitted.push_str(&out);
+            }
+        }
+        assert!(
+            emitted.is_empty(),
+            "the replayed prefix must not be forwarded, got {emitted:?}"
+        );
+
+        for i in 61..=62 {
+            if let Some(out) = buf.push_delta(&format!("Line {i}\n")) {
+                emitted.push_str(&out);
+            }
+        }
+        assert_eq!(emitted, "Line 61\nLine 62\n");
+        assert_eq!(buf.finish(), None);
+    }
+
+    /// A retry that matches the head window but then diverges must not have its
+    /// new text dropped. Divergence is only knowable once enough characters have
+    /// arrived to rule the replay out, so this resolves late — either when the
+    /// count is reached, or at end of stream.
+    #[test]
+    fn test_dedup_buffer_diverging_replay_falls_back_to_tail_matching() {
+        let accumulated = "aaaabbbbccccdddd"; // 16 chars
+
+        // Resolved once pending reaches the accumulated length.
+        let mut buf = DedupBuffer::new(accumulated, 4, false);
+        assert_eq!(
+            buf.push_delta("aaaaZZZZ"),
+            None,
+            "still indistinguishable from a replay in progress"
+        );
+        assert_eq!(
+            buf.push_delta("ZZZZZZZZ"),
+            Some("aaaaZZZZZZZZZZZZ".to_string()),
+            "divergent text must be forwarded, not dropped"
+        );
+
+        // Resolved at end of stream, before the count is reached.
+        let mut buf = DedupBuffer::new(accumulated, 4, false);
+        assert_eq!(buf.push_delta("aaaaZZZZ"), None);
+        assert_eq!(buf.finish(), Some("aaaaZZZZ".to_string()));
+    }
+
+    #[test]
+    fn test_dedup_buffer_retry_replaying_short_accumulated() {
+        // The probe is capped at what was actually emitted, so a six-character
+        // prefix settles this immediately instead of waiting for the window.
+        let mut buf = DedupBuffer::new("Hello ", 50, false);
+        assert_eq!(buf.push_delta("Hello world"), Some("world".to_string()));
+        assert_eq!(buf.finish(), None);
+    }
+
+    #[test]
+    fn test_dedup_buffer_retry_replay_that_dies_early_emits_nothing() {
+        let mut buf = DedupBuffer::new("Hello world, and more", 4, false);
+        assert_eq!(buf.push_delta("Hello"), None);
+        assert_eq!(buf.finish(), None, "a truncated replay is all duplicate");
     }
 }

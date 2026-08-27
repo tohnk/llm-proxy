@@ -32,6 +32,15 @@ streaming responses survive transient upstream failures.
 >    reporting a failed generation is **retried** (§7.4).
 > 10. The wall clock **extends** while the upstream reports only congestion (§7.3).
 > 11. Retrying **stops early** when the same cause repeats without making progress (§7.5).
+> 12. An error reported **inside** a 200 SSE stream is classified rather than ignored (§7.6).
+> 13. A failed generation **discards** its partial tool state before any flush, and passthrough
+>     never forwards a mixed source chunk (§9).
+> 14. Configuration is **strict**: unknown keys are rejected and an env-selected path must
+>     exist (§4).
+> 15. The backoff before a retry that **cannot happen** is skipped (§6.2).
+> 16. CORS is **closed by default**; browser origins must be listed explicitly (§4).
+> 17. Dedup detects a **full upstream restart** via a head window, not only a tail one (§6.3).
+> 18. Upstream output and accumulated state are **byte-bounded** (§4).
 >
 > §3.1 records the downstream-channel properties that any change to the streaming path must
 > preserve, independent of the payload type.
@@ -151,12 +160,14 @@ TOML file, path from `--config` or `$LLM_PROXY_CONFIG`, defaulting to
 [server]
 bind = "127.0.0.1:8787"
 max_body_bytes = 33554432           # 32 MiB; see §5 — axum's 2 MiB default rejects long chats
+allowed_origins = []                # browser origins; empty = no CORS headers at all
 
 [upstream]
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key_env = "GEMINI_API_KEY"     # read the key from this env var (recommended)
 api_key = ""                        # optional: direct key override in config / env (LLM_PROXY_UPSTREAM_API_KEY)
 connect_timeout_secs = 10
+max_response_bytes = 33554432       # 32 MiB cap on a non-streaming / models / error body
 
 [resume]
 enabled = true
@@ -173,15 +184,23 @@ first_chunk_timeout_secs = 120      # timeout until first content, tool-call, or
 idle_timeout_secs = 45              # no chunk for this long => treat as break
 resume_on_length_finish = false     # whether finish_reason "length" is treated as resumable
 max_no_progress_attempts = 3        # stop after this many identical, fruitless failures (§7.5)
+max_accumulated_bytes = 33554432    # 32 MiB cap on accumulated response text
 
 [tools]
 buffer_tool_calls = true            # assemble tool call fragments before emitting (§9)
+max_tool_call_bytes = 4194304       # 4 MiB cap on one call's assembled arguments
 disable_resume_for_tool_responses = false
 
 [log]
 level = "info"
 log_bodies = false                  # request/response bodies at trace level; off by default
 ```
+
+**Strictness — *Amended (2026-08-24)*.** Unknown keys are rejected in every section: a
+typo such as `max_attemps` would otherwise silently use the default for a security, timeout
+or endpoint setting. A config path named through `$LLM_PROXY_CONFIG` is treated as explicit,
+so a path that does not exist is an error rather than a silent fall back to defaults; only
+the implicit `~/.config/...` path may be absent.
 
 `base_url` is fully configurable, and any query string on it is preserved when the endpoint
 path is appended. If `base_url` already ends with the endpoint path *as a whole path segment*
@@ -190,7 +209,29 @@ lets a `base_url` point directly at a single endpoint. The comparison is made on
 boundaries, so a base merely *ending with* those characters (`.../v1/mock_models` for the
 `models` path) still has the path appended.
 
-Permissive CORS headers are enabled to seamlessly support local desktop clients (like Jan.ai).
+**CORS — *Amended (2026-08-24)*.** No CORS headers are emitted unless
+`server.allowed_origins` lists an origin. Jan.ai and comparable desktop clients issue native
+HTTP requests and send no `Origin`, so they never needed them; permissive headers only
+widened the surface, letting any page a browser happens to load reach the loopback listener
+and spend the configured account's quota. Browser-based clients opt in by listing their
+origin, which also grants `GET`/`POST`/`OPTIONS` and the `content-type`/`authorization`
+headers.
+
+**Resource bounds — *Amended (2026-08-24)*.** Timeouts bound how *long* an upstream may
+take, not how much it may send, so a fast malfunctioning or hostile upstream could exhaust
+memory well inside every deadline. Three independent caps close that, all set far above any
+legitimate workload so they never truncate real output:
+
+| Setting | Default | Bounds |
+|---|---|---|
+| `upstream.max_response_bytes` | 32 MiB | a non-streaming body, a `/v1/models` body, or an error body read before classification |
+| `resume.max_accumulated_bytes` | 32 MiB | text accumulated across all attempts of one response — roughly eight million tokens |
+| `tools.max_tool_call_bytes` | 4 MiB | assembled arguments of a single buffered tool call, which never reach `accumulated_text` |
+
+Exceeding the accumulation cap ends the stream with `finish_reason: "length"`, which reports
+the truncation honestly rather than presenting it as a clean stop. Exceeding the tool-call
+cap discards the call and retries it as a failed generation (§7.4), since truncated arguments
+cannot be valid JSON.
 
 ---
 
@@ -259,6 +300,12 @@ loop {
 **During backoff, the downstream stream must stay alive.** Emit an SSE comment line
 (`: retrying\n\n`) every 10 seconds while sleeping to prevent socket timeouts.
 
+**No backoff before a retry that cannot happen — *Amended (2026-08-24)*.** The limits are
+tested at the top of the loop, so a naive implementation sleeps a full backoff after the
+final failure and only then discovers it had no attempt left. With `backoff_max_ms = 30000`
+that is up to 30 s of dead waiting at the end of an already-doomed request. Check whether
+another attempt is permitted *before* sleeping.
+
 ### 6.3 Overlap deduplication
 
 On every attempt after the first:
@@ -269,6 +316,26 @@ On every attempt after the first:
 4. If no `k` matches, forward `pending` unchanged.
 5. From that point on in this attempt, forward deltas as they arrive with no buffering.
 6. All comparisons and slicing operate strictly on `char` boundaries. Anything forwarded downstream is appended to `accumulated_text`.
+
+**Full restarts — *Amended (2026-08-24)*.** The procedure above matches the *end* of what was
+emitted against the *start* of the retry, which finds the overlap when an upstream continues.
+It cannot see a **full restart**: an upstream that ignores the prefix and regenerates the
+whole response. Once more than `dedup_window_chars` have been emitted, the retry's opening no
+longer touches the tail at all, no `k` matches, and every character emitted so far is
+delivered a second time. §2 names this as the very behaviour `Instructed` mode exists to
+absorb, so it must actually be absorbed.
+
+A **head** window separates the two cases before step 3:
+
+1. Let `head` be the first `min(dedup_window_chars, accumulated_text.len())` characters of `accumulated_text`.
+2. If `pending` begins with `head`, the retry is replaying from the start. Continue buffering until `pending` reaches `accumulated_text.len()`, then drop that whole prefix and forward the remainder.
+3. Otherwise apply the tail procedure above, unchanged.
+
+A replay that diverges after matching the head falls back to tail matching rather than
+dropping the divergent text, and a replay that ends before completing forwards nothing, since
+all of it was duplicate. Continuation — the common case — is unaffected and still resolves
+after one window; only a detected restart buffers further, and only up to what was already
+emitted.
 
 ### 6.4 Building the continuation request
 
@@ -363,6 +430,28 @@ shipped defaults (900 normal, 300 overloaded) it is inert, and it takes effect o
 
 Recommended pairing: set `max_attempts` high enough that it never binds and let the wall
 clock be the single governor.
+
+### 7.6 Errors inside a 200 stream — *Amended (2026-08-24)*
+
+An upstream may report failure as an SSE event rather than a status code:
+
+```
+data: {"error":{"message":"quota exhausted"}}
+data: [DONE]
+```
+
+Such an event carries no `choices` and no delta, so a chunk parser ignores it — and the
+`[DONE]` that follows then satisfies §7's terminal rule, turning an upstream failure into a
+successful *empty* completion. This is the same silent failure the give-up rules exist to
+prevent, arriving by a different route.
+
+Any event with a non-null root `error` is therefore classified before delta extraction:
+
+- **Fatal** if the message indicates a context-length or content-policy failure (§7.1) —
+  retrying resends exactly what was refused.
+- **Retryable** otherwise, since in-band errors are commonly transient quota or capacity
+  problems. A permanent one repeats identically and is caught by the no-progress cutoff
+  (§7.5), so this cannot loop.
 
 ### 7.5 No-progress cutoff — *Amended (2026-08-24)*
 
@@ -506,7 +595,12 @@ deadline is clamped to it.
 ## 9. Tool calls and reasoning content
 
 - **Tool Call Buffering (`buffer_tool_calls = true`, default):** Accumulate `delta.tool_calls[*]` keyed by index. When `finish_reason: "tool_calls"` is reached, emit the complete assembled tool call(s) in a single consolidated delta followed by the finish chunk. If an attempt fails mid-tool-call, discard the uncommitted tool call state and retry from the last committed text state.
-- **Tool Call Passthrough (`buffer_tool_calls = false`):** Forward tool call deltas as they arrive, rewriting IDs and suppressing intermediate finish reasons. Note that passthrough has **no equivalent of the §6.3 overlap window**: fragments already forwarded by an attempt that later fails cannot be recalled, so a cut mid-tool-call leaves the client holding the abandoned fragment as well as the complete retry. Buffering (the default) does not have this problem, because nothing is emitted until the call is whole.
+  - ***Amended (2026-08-24)*:** a finish reason reporting a *failed* generation (§7.4) must be
+    recognised **before** the flush, not after. `MALFORMED_FUNCTION_CALL` normalises to
+    `tool_calls`, so a flush keyed on the normalised value would push the half-assembled call
+    downstream and then retry — leaving the client with a broken call followed by its
+    replacement, two calls for one intended invocation.
+- **Tool Call Passthrough (`buffer_tool_calls = false`):** Emit tool call deltas as they arrive, rewriting IDs and suppressing intermediate finish reasons. ***Amended (2026-08-24)*:** emit a chunk containing *only* the tool calls rather than forwarding the upstream object verbatim. A single upstream event may carry `content` and `reasoning` alongside `tool_calls`, and those are emitted by their own branches; forwarding the mixed source object sends them twice. Note that passthrough has **no equivalent of the §6.3 overlap window**: fragments already forwarded by an attempt that later fails cannot be recalled, so a cut mid-tool-call leaves the client holding the abandoned fragment as well as the complete retry. Buffering (the default) does not have this problem, because nothing is emitted until the call is whole.
 - **Reasoning / Thinking content:** Forward `delta.reasoning_content` / `delta.reasoning` downstream immediately, but **exclude from `accumulated_text` and continuation `messages`**.
 - **`disable_resume_for_tool_responses = true`:** Requests with a `tools` array skip resumption if a failure occurs after text/content has begun emitting.
 
@@ -531,6 +625,10 @@ When the downstream client disconnects (detected via mpsc channel send failure),
 - Debug: dedup results (overlap character count).
 - Trace: request and response bodies (gated by `log_bodies = true`).
 - Redact Authorization headers; never log secret API keys.
+- ***Amended (2026-08-24)*:** the upstream URL is redacted before logging — query strings and
+  userinfo both carry credentials for some providers.
+- `log_bodies = true` only gates the `trace!` calls; the filter must also admit them. Warn at
+  startup when the configured level would discard the traces it was just asked to emit.
 
 ---
 

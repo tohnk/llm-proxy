@@ -10,11 +10,12 @@ use tracing::{debug, trace, warn};
 
 use crate::config::Config;
 use crate::error::{
-    is_failed_generation_finish_reason, normalize_finish_reason, AttemptOutcome, Cause,
+    is_context_or_policy_failure, is_failed_generation_finish_reason, normalize_finish_reason,
+    ApiError, AttemptOutcome, Cause,
 };
 use crate::proxy::chunks::{
-    build_chunk_with_content, build_chunk_with_reasoning, format_sse_data, parse_chunk_details,
-    rewrite_upstream_chunk, UsageAccumulator,
+    build_chunk_with_content, build_chunk_with_reasoning, build_chunk_with_tool_calls,
+    format_sse_data, parse_chunk_details, rewrite_upstream_chunk, UsageAccumulator,
 };
 use crate::proxy::dedup::DedupBuffer;
 use crate::proxy::tools::ToolCallsBuffer;
@@ -110,7 +111,7 @@ pub async fn consume_upstream_stream(
         config.resume.dedup_window_chars,
         attempt == 1,
     );
-    let mut tool_buffer = ToolCallsBuffer::new();
+    let mut tool_buffer = ToolCallsBuffer::new(config.tools.max_tool_call_bytes);
     let mut last_finish_reason: Option<String> = None;
     let mut seen_done = false;
 
@@ -213,6 +214,34 @@ pub async fn consume_upstream_stream(
             }
         };
 
+        // §7: an upstream may report failure *inside* a 200 stream rather than
+        // by status code. Such an event carries no delta, so it would otherwise
+        // be ignored — and a following `[DONE]` would turn it into a successful
+        // empty completion, the exact silent failure §7's give-up rules exist to
+        // prevent.
+        if let Some(error) = chunk_json.get("error").filter(|e| !e.is_null()) {
+            let body = serde_json::json!({ "error": error }).to_string();
+            warn!(error = %body, "Upstream reported an error inside the SSE stream");
+
+            if is_context_or_policy_failure(&body) {
+                return Ok(AttemptOutcome::Fatal(ApiError::from_status_and_body(
+                    reqwest::StatusCode::BAD_GATEWAY,
+                    &body,
+                )));
+            }
+            // Anything else is treated as retryable: an in-band error is often a
+            // transient quota or capacity problem. A genuinely permanent one
+            // repeats identically and is caught by the no-progress cutoff (§7.5).
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream stream error")
+                .to_string();
+            return Ok(AttemptOutcome::Retryable(Cause::UpstreamStreamError(
+                message,
+            )));
+        }
+
         let details = parse_chunk_details(&chunk_json);
 
         // Update model name if this is the first time we see it from upstream chunks
@@ -287,19 +316,15 @@ pub async fn consume_upstream_stream(
             if config.tools.buffer_tool_calls {
                 tool_buffer.process_tool_call_deltas(&tool_calls);
             } else {
-                rewrite_upstream_chunk(
-                    &mut chunk_json,
+                let chunk = build_chunk_with_tool_calls(
                     state.downstream_id,
                     state.created,
                     state.model,
-                    state.emitted_role,
-                    false,
+                    &tool_calls,
+                    !*state.emitted_role,
                 );
-                if downstream_tx
-                    .send(format_sse_data(&chunk_json))
-                    .await
-                    .is_err()
-                {
+                *state.emitted_role = true;
+                if downstream_tx.send(format_sse_data(&chunk)).await.is_err() {
                     debug!("Downstream client disconnected while sending tool call chunk");
                     return Err(ClientDisconnected);
                 }
@@ -312,6 +337,18 @@ pub async fn consume_upstream_stream(
             *state.attempt_had_meaningful_chunk = true;
             if let Some(text_to_forward) = dedup_buffer.push_delta(&content) {
                 if !text_to_forward.is_empty() {
+                    if state
+                        .accumulated_text
+                        .len()
+                        .saturating_add(text_to_forward.len())
+                        > config.resume.max_accumulated_bytes
+                    {
+                        warn!(
+                            limit = config.resume.max_accumulated_bytes,
+                            "Accumulated response hit the configured size limit; ending the stream"
+                        );
+                        return Ok(AttemptOutcome::Terminal("length".to_string()));
+                    }
                     state.accumulated_text.push_str(&text_to_forward);
                     let chunk = build_chunk_with_content(
                         state.downstream_id,
@@ -371,6 +408,25 @@ pub async fn consume_upstream_stream(
                 );
             }
 
+            // Decided BEFORE any flush: a failed generation must not push its
+            // half-assembled call downstream, or the client sees a broken call
+            // followed by the retry's replacement.
+            if is_failed_generation_finish_reason(&fr) {
+                warn!(
+                    upstream_finish_reason = %fr,
+                    "Upstream reported a failed generation; discarding partial tool state and retrying"
+                );
+                return Ok(AttemptOutcome::Retryable(Cause::MalformedFunctionCall));
+            }
+
+            if tool_buffer.is_truncated() {
+                warn!(
+                    limit = config.tools.max_tool_call_bytes,
+                    "Tool call arguments exceeded the configured limit; discarding and retrying"
+                );
+                return Ok(AttemptOutcome::Retryable(Cause::MalformedFunctionCall));
+            }
+
             if normalized == "tool_calls" && config.tools.buffer_tool_calls {
                 // Flush assembled tool calls chunk downstream before finish chunk
                 if let Some(tc_chunk) = tool_buffer.build_assembled_tool_calls_chunk(
@@ -391,13 +447,7 @@ pub async fn consume_upstream_stream(
                 }
             }
 
-            if is_failed_generation_finish_reason(&fr) {
-                warn!(
-                    upstream_finish_reason = %fr,
-                    "Upstream reported a failed generation; retrying"
-                );
-                Ok(AttemptOutcome::Retryable(Cause::MalformedFunctionCall))
-            } else if normalized == "length" && config.resume.resume_on_length_finish {
+            if normalized == "length" && config.resume.resume_on_length_finish {
                 *state.finish_reason = Some(normalized.to_string());
                 Ok(AttemptOutcome::Retryable(Cause::LengthFinishResumed))
             } else {

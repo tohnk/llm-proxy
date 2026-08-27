@@ -121,6 +121,40 @@ pub fn build_chunk_with_reasoning(
     })
 }
 
+/// Build a chunk carrying only tool-call deltas.
+///
+/// Used by passthrough mode instead of forwarding the upstream object verbatim:
+/// a single upstream event may carry `content` and `reasoning` alongside
+/// `tool_calls`, and those fields are emitted by their own branches. Forwarding
+/// the mixed source object would send them twice.
+pub fn build_chunk_with_tool_calls(
+    downstream_id: &str,
+    created: i64,
+    model: &str,
+    tool_calls: &[Value],
+    include_role: bool,
+) -> Value {
+    let mut delta = serde_json::Map::new();
+    if include_role {
+        delta.insert("role".to_string(), Value::String("assistant".to_string()));
+    }
+    delta.insert("tool_calls".to_string(), Value::Array(tool_calls.to_vec()));
+
+    serde_json::json!({
+        "id": downstream_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": Value::Null
+            }
+        ]
+    })
+}
+
 pub fn build_chunk_with_finish(
     downstream_id: &str,
     created: i64,

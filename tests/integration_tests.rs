@@ -715,12 +715,21 @@ async fn test_16_reasoning_content_forwarding() {
     assert_eq!(result.done_count, 1);
 }
 
-// 17. disable_resume_for_tool_responses = true — cuts mid-stream after some text, proxy does not attempt continuation.
+// 17. A tool-call stream cut before any text is emitted.
+//
+// §9 suppresses resumption for tool requests only "if a failure occurs after
+// text/content has begun emitting". The mock's tool fixture emits no text, so
+// that condition is not met and resumption correctly proceeds. The case where
+// text *has* been emitted needs a raw upstream — the mock always serves its tool
+// fixture when `tools` is present — and lives in
+// `raw_upstream_tests::test_disable_resume_for_tool_responses_after_text`.
 #[tokio::test]
-async fn test_17_disable_resume_for_tool_responses() {
+async fn test_17_tool_stream_cut_before_any_text_still_resumes() {
     let harness = TestHarness::setup(|config| {
-        config.upstream.base_url =
-            format!("{}/chat/completions?cut_after=10", config.upstream.base_url);
+        config.upstream.base_url = format!(
+            "{}/chat/completions?cut_after=1&cut_first_n_requests=1",
+            config.upstream.base_url
+        );
         config.tools.disable_resume_for_tool_responses = true;
     })
     .await;
@@ -737,15 +746,21 @@ async fn test_17_disable_resume_for_tool_responses() {
     )
     .await;
 
-    assert_eq!(result.done_count, 1);
-    // Should stop on the first cut because content was emitted and resumption is disabled for tool requests
     assert_eq!(
         harness
             .mock_state
             .request_counter
             .load(std::sync::atomic::Ordering::SeqCst),
-        1
+        2,
+        "no text was emitted, so §9 does not suppress resumption"
     );
+    assert_eq!(
+        result.tool_calls.len(),
+        1,
+        "only the retry's assembled call should be emitted"
+    );
+    assert_eq!(result.finish_reasons, vec!["tool_calls".to_string()]);
+    assert_eq!(result.done_count, 1);
 }
 
 // 18. resume.enabled = false — cuts mid-stream, proxy immediately terminates with stop and [DONE].
@@ -1755,12 +1770,46 @@ async fn test_streaming_response_headers() {
     );
 }
 
-// §4: "Permissive CORS headers are enabled to seamlessly support local desktop
-// clients (like Jan.ai)." Covers both the preflight and the simple request.
+// §4: no CORS headers unless origins are configured. Jan.ai and other desktop
+// clients send no `Origin`, so permissive headers would only let any page a
+// browser loads spend the configured account's quota through this listener.
 #[tokio::test]
-async fn test_cors_preflight_and_simple_request() {
+async fn test_no_cors_headers_by_default() {
     let harness = TestHarness::setup(|config| {
         config.upstream.base_url = format!("{}/chat/completions", config.upstream.base_url);
+    })
+    .await;
+
+    let simple = harness
+        .client
+        .get(format!("http://{}/health", harness.proxy_addr))
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(simple.status(), reqwest::StatusCode::OK);
+    assert!(
+        !simple.headers().contains_key("access-control-allow-origin"),
+        "an unconfigured proxy must not grant browser access"
+    );
+
+    // A native client with no Origin is unaffected.
+    let native = harness
+        .client
+        .get(format!("http://{}/health", harness.proxy_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(native.status(), reqwest::StatusCode::OK);
+}
+
+// ...and an explicitly allowed origin does get them.
+#[tokio::test]
+async fn test_configured_origin_is_allowed() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!("{}/chat/completions", config.upstream.base_url);
+        config.server.allowed_origins = vec!["http://localhost:1420".to_string()];
     })
     .await;
 
@@ -1772,40 +1821,32 @@ async fn test_cors_preflight_and_simple_request() {
         )
         .header("Origin", "http://localhost:1420")
         .header("Access-Control-Request-Method", "POST")
-        .header(
-            "Access-Control-Request-Headers",
-            "content-type,authorization",
-        )
+        .header("Access-Control-Request-Headers", "content-type")
         .send()
         .await
         .unwrap();
 
-    assert!(
-        preflight.status().is_success(),
-        "preflight returned {}",
-        preflight.status()
+    assert!(preflight.status().is_success());
+    assert_eq!(
+        preflight.headers()["access-control-allow-origin"],
+        "http://localhost:1420"
     );
-    let h = preflight.headers();
-    assert!(h.contains_key("access-control-allow-origin"));
-    assert!(h.contains_key("access-control-allow-methods"));
-    assert!(h.contains_key("access-control-allow-headers"));
 
-    let simple = harness
+    // An origin outside the list is not granted access.
+    let other = harness
         .client
         .get(format!("http://{}/health", harness.proxy_addr))
-        .header("Origin", "http://localhost:1420")
+        .header("Origin", "https://evil.example")
         .send()
         .await
         .unwrap();
-
-    assert_eq!(simple.status(), reqwest::StatusCode::OK);
-    assert!(simple.headers().contains_key("access-control-allow-origin"));
+    assert!(!other.headers().contains_key("access-control-allow-origin"));
 }
 
 // §5: unknown routes return 404 with an OpenAI-shaped error body, and CORS still
 // applies so the browser client sees the 404 rather than a network error.
 #[tokio::test]
-async fn test_unknown_endpoint_shape_and_cors() {
+async fn test_unknown_endpoint_error_shape() {
     let harness = TestHarness::setup(|_| {}).await;
 
     let resp = harness
@@ -1817,7 +1858,10 @@ async fn test_unknown_endpoint_shape_and_cors() {
         .unwrap();
 
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
-    assert!(resp.headers().contains_key("access-control-allow-origin"));
+    assert!(
+        !resp.headers().contains_key("access-control-allow-origin"),
+        "no CORS grant should be issued for an unconfigured origin"
+    );
 
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -2515,5 +2559,139 @@ async fn test_progress_resets_the_no_progress_counter() {
         "partial content should still have been delivered"
     );
     assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+// The attempt limits are checked at the top of the loop, so without an explicit
+// guard the last failed attempt sleeps out a full backoff before discovering it
+// had no retry left — up to 30s of dead waiting at the end of a doomed request.
+#[tokio::test]
+async fn test_final_failed_attempt_does_not_sleep() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!(
+            "{}/chat/completions?status=503&fail_first=100",
+            config.upstream.base_url
+        );
+        config.resume.max_attempts = 2;
+        config.resume.backoff_initial_ms = 1_500;
+        config.resume.backoff_max_ms = 5_000;
+        config.resume.backoff_multiplier = 2.0;
+        config.resume.backoff_jitter = 0.0;
+    })
+    .await;
+
+    let started = Instant::now();
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        harness
+            .mock_state
+            .request_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(result.done_count, 1);
+    // Only the backoff between attempts 1 and 2 should be paid: ~1.5s, not the
+    // ~4.5s that a trailing 3s sleep would add.
+    assert!(
+        elapsed < Duration::from_millis(2_800),
+        "the final failure slept before giving up: {elapsed:?}"
+    );
+}
+
+// §6.3: an upstream that ignores the prefix and regenerates the whole response
+// after more than `dedup_window_chars` were already emitted. The tail window
+// cannot see this overlap — the retry's opening no longer touches the end of
+// what was emitted — so without head-window detection every character emitted
+// so far is delivered a second time.
+#[tokio::test]
+async fn test_full_restart_beyond_the_dedup_window_is_deduplicated() {
+    let harness = TestHarness::setup(|config| {
+        // 40 lines is well past the 240-character window.
+        config.upstream.base_url = format!(
+            "{}/chat/completions?cut_after=40&cut_first_n_requests=1&restart=true",
+            config.upstream.base_url
+        );
+        config.resume.dedup_window_chars = 240;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    let expected = default_corpus();
+    assert!(
+        expected.chars().count() > 240,
+        "fixture must exceed the dedup window to be meaningful"
+    );
+    assert_eq!(
+        harness
+            .mock_state
+            .request_counter
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        result.text, expected,
+        "the replayed prefix was not deduplicated"
+    );
+    assert_eq!(result.text.matches("Line 1\n").count(), 1);
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+// The accumulation cap protects memory without truncating real generations: it
+// is far above any legitimate response, and hitting it ends the stream honestly
+// rather than silently.
+#[tokio::test]
+async fn test_accumulated_text_cap_ends_the_stream() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!("{}/chat/completions", config.upstream.base_url);
+        config.resume.max_accumulated_bytes = 64;
+    })
+    .await;
+
+    let result = collect_stream_response(
+        &harness.client,
+        &format!("http://{}/v1/chat/completions", harness.proxy_addr),
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert!(
+        result.text.len() <= 64,
+        "the cap must actually bound memory"
+    );
+    assert!(
+        !result.text.is_empty(),
+        "text emitted before the cap is kept"
+    );
+    assert_eq!(
+        result.finish_reasons,
+        vec!["length".to_string()],
+        "truncation must be reported honestly, not as a clean stop"
+    );
     assert_eq!(result.done_count, 1);
 }

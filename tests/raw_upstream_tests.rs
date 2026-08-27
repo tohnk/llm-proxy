@@ -276,6 +276,7 @@ async fn spawn_proxy(base_url: String, customize: impl FnOnce(&mut Config)) -> S
 #[derive(Default)]
 struct StreamResult {
     text: String,
+    reasoning: String,
     chunk_ids: Vec<String>,
     done_count: usize,
     finish_reasons: Vec<String>,
@@ -330,6 +331,11 @@ async fn collect(client: &Client, proxy: SocketAddr, body: Value) -> StreamResul
             }
             if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
                 out.text.push_str(c);
+            }
+            for field in ["reasoning_content", "reasoning"] {
+                if let Some(r) = delta.get(field).and_then(|r| r.as_str()) {
+                    out.reasoning.push_str(r);
+                }
             }
             if delta.get("tool_calls").is_some() {
                 out.tool_call_chunks.push(delta["tool_calls"].clone());
@@ -1150,4 +1156,249 @@ async fn test_models_endpoint_stalled_body_times_out() {
 
     assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+// ---------------------------------------------------------------------------
+// Failed generations, mixed deltas, and in-band errors
+// ---------------------------------------------------------------------------
+
+/// §9: a failed generation must discard its half-assembled tool call. Flushing
+/// it first would hand the client a broken call followed by the retry's
+/// replacement — two calls for one intended invocation.
+#[tokio::test]
+async fn test_malformed_function_call_discards_partial_tool_state() {
+    let upstream = spawn_raw_upstream(|req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            if req.num == 1 {
+                write_sse(
+                    &mut sock,
+                    &tool_delta_chunk(
+                        json!([{"index": 0, "id": "call_partial", "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{\"ci"}}]),
+                        true,
+                    ),
+                )
+                .await;
+                write_sse(
+                    &mut sock,
+                    &finish_chunk("function_call_filter: MALFORMED_FUNCTION_CALL"),
+                )
+                .await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            } else {
+                write_sse(
+                    &mut sock,
+                    &tool_delta_chunk(
+                        json!([{"index": 0, "id": "call_good", "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]),
+                        true,
+                    ),
+                )
+                .await;
+                write_sse(&mut sock, &finish_chunk("tool_calls")).await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            }
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |_| {}).await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(
+        upstream.requests(),
+        2,
+        "the failed generation should be retried"
+    );
+    assert_eq!(
+        result.tool_call_chunks.len(),
+        1,
+        "the discarded attempt must not emit its partial call"
+    );
+    let calls = result.tool_call_chunks[0].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_good");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(result.finish_reasons, vec!["tool_calls".to_string()]);
+    assert_eq!(result.roles.len(), 1);
+    assert_eq!(result.done_count, 1);
+}
+
+/// A single upstream event may carry content, reasoning and tool calls at once.
+/// Passthrough mode must emit each field exactly once — forwarding the mixed
+/// source object from the tool branch would re-send the other two.
+#[tokio::test]
+async fn test_passthrough_does_not_duplicate_mixed_deltas() {
+    let upstream = spawn_raw_upstream(|_req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            write_sse(
+                &mut sock,
+                &json!({
+                    "id": "upstream-raw",
+                    "object": "chat.completion.chunk",
+                    "created": 1690000000,
+                    "model": "raw-mock-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": "VISIBLE",
+                            "reasoning_content": "THINKING",
+                            "tool_calls": [{"index": 0, "id": "call_m", "type": "function",
+                                            "function": {"name": "f", "arguments": "{}"}}]
+                        },
+                        "finish_reason": Value::Null
+                    }]
+                }),
+            )
+            .await;
+            write_sse(&mut sock, &finish_chunk("tool_calls")).await;
+            write_done(&mut sock).await;
+            end_stream_cleanly(&mut sock).await;
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |config| {
+        config.tools.buffer_tool_calls = false;
+    })
+    .await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(result.text, "VISIBLE", "content emitted more than once");
+    assert_eq!(
+        result.reasoning, "THINKING",
+        "reasoning emitted more than once"
+    );
+    assert_eq!(
+        result.tool_call_chunks.len(),
+        1,
+        "tool calls emitted more than once"
+    );
+    assert_eq!(result.roles.len(), 1);
+    assert_eq!(result.done_count, 1);
+}
+
+/// §7: an upstream can report failure inside a 200 stream. Such an event has no
+/// delta, so ignoring it and honouring the following `[DONE]` would produce a
+/// successful, empty completion.
+#[tokio::test]
+async fn test_in_band_error_event_is_retried() {
+    let upstream = spawn_raw_upstream(|req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            if req.num == 1 {
+                write_sse(&mut sock, &json!({"error": {"message": "quota exhausted"}})).await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            } else {
+                serve_rest_of_corpus(&mut sock, resume_offset(&req.body)).await;
+            }
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |_| {}).await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(upstream.requests(), 2, "an in-band error should be retried");
+    assert_eq!(result.text, default_corpus());
+    assert!(
+        result.errors.is_empty(),
+        "the recovered request must look clean"
+    );
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+/// ...but an in-band refusal is fatal, exactly as the same message would be over
+/// a status code: retrying resends the content that was refused.
+#[tokio::test]
+async fn test_in_band_policy_error_is_fatal() {
+    let upstream = spawn_raw_upstream(|_req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            write_sse(
+                &mut sock,
+                &json!({"error": {"message": "Request blocked by safety filter"}}),
+            )
+            .await;
+            write_done(&mut sock).await;
+            end_stream_cleanly(&mut sock).await;
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |_| {}).await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(upstream.requests(), 1, "a refusal must not be retried");
+    assert_eq!(result.errors.len(), 1);
+    assert!(result.errors[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("safety filter"));
+    assert_eq!(result.done_count, 1);
+}
+
+/// §9: `disable_resume_for_tool_responses` suppresses resumption only once text
+/// has begun emitting. The mock upstream cannot express this — a request with
+/// `tools` always gets its tool fixture, which emits no text — so it is driven
+/// from a raw socket.
+#[tokio::test]
+async fn test_disable_resume_for_tool_responses_after_text() {
+    fn body_with_tools() -> Value {
+        json!({
+            "model": "test-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "Count lines"}],
+            "tools": [{"type": "function", "function": {"name": "noop"}}]
+        })
+    }
+
+    async fn run(disable: bool) -> (StreamResult, u32) {
+        let upstream = spawn_raw_upstream(|req, mut sock| {
+            Box::pin(async move {
+                let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+                if req.num == 1 {
+                    for (i, line) in corpus_lines_from(0).iter().take(4).enumerate() {
+                        write_sse(&mut sock, &content_chunk(line, i == 0)).await;
+                    }
+                    truncate_mid_chunk(sock).await;
+                } else {
+                    serve_rest_of_corpus(&mut sock, resume_offset(&req.body)).await;
+                }
+            })
+        })
+        .await;
+
+        let proxy = spawn_proxy(upstream.base_url(), move |config| {
+            config.tools.disable_resume_for_tool_responses = disable;
+        })
+        .await;
+        let result = collect(&test_client(), proxy, body_with_tools()).await;
+        let requests = upstream.requests();
+        (result, requests)
+    }
+
+    let (disabled, disabled_requests) = run(true).await;
+    assert_eq!(
+        disabled_requests, 1,
+        "resumption should have been suppressed"
+    );
+    assert!(
+        !disabled.text.is_empty(),
+        "the partial answer is still delivered"
+    );
+    assert_ne!(disabled.text, default_corpus(), "it must remain truncated");
+    assert_eq!(disabled.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(disabled.done_count, 1);
+
+    let (enabled, enabled_requests) = run(false).await;
+    assert_eq!(enabled_requests, 2, "control: resumption should proceed");
+    assert_eq!(enabled.text, default_corpus());
 }

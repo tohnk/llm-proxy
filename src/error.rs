@@ -30,6 +30,8 @@ pub enum Cause {
     LengthFinishResumed,
     #[error("Upstream reported a malformed function call")]
     MalformedFunctionCall,
+    #[error("Upstream reported an error inside the SSE stream: {0}")]
+    UpstreamStreamError(String),
 }
 
 impl Cause {
@@ -52,6 +54,7 @@ impl Cause {
             Cause::StreamEndedUnexpectedly => "stream-ended".to_string(),
             Cause::LengthFinishResumed => "length-finish".to_string(),
             Cause::MalformedFunctionCall => "malformed-function-call".to_string(),
+            Cause::UpstreamStreamError(_) => "upstream-stream-error".to_string(),
         }
     }
 

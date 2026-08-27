@@ -9,7 +9,19 @@ use tracing::{error, info, trace, warn};
 
 use crate::config::{build_upstream_url, Config};
 use crate::error::{classify_http_response, ApiError, AttemptOutcome, Cause};
+use crate::proxy::read_body_limited;
 use crate::proxy::stream::calculate_backoff;
+
+/// Skip the backoff when no attempt remains: the limits are checked at the top
+/// of the loop, so the final failure would otherwise sleep for nothing.
+fn another_attempt_permitted(
+    config: &Config,
+    next_attempt: u32,
+    started_at: Instant,
+    max_wall_clock: Duration,
+) -> bool {
+    next_attempt <= config.resume.max_attempts && started_at.elapsed() < max_wall_clock
+}
 
 pub async fn handle_nonstreaming_request(
     client: Client,
@@ -101,7 +113,9 @@ pub async fn handle_nonstreaming_request(
 
                 let backoff_dur = calculate_backoff(&config, attempt, cause.retry_after())
                     .min(max_wall_clock.saturating_sub(started_at.elapsed()));
-                tokio::time::sleep(backoff_dur).await;
+                if another_attempt_permitted(&config, attempt + 1, started_at, max_wall_clock) {
+                    tokio::time::sleep(backoff_dur).await;
+                }
                 attempt += 1;
                 continue;
             }
@@ -115,7 +129,7 @@ pub async fn handle_nonstreaming_request(
             .unwrap_or_else(|| HeaderValue::from_static("application/json"));
         let body_bytes = match tokio::time::timeout(
             max_wall_clock.saturating_sub(started_at.elapsed()),
-            response.bytes(),
+            read_body_limited(response, config.upstream.max_response_bytes),
         )
         .await
         {
@@ -131,7 +145,9 @@ pub async fn handle_nonstreaming_request(
 
                 let backoff_dur = calculate_backoff(&config, attempt, None)
                     .min(max_wall_clock.saturating_sub(started_at.elapsed()));
-                tokio::time::sleep(backoff_dur).await;
+                if another_attempt_permitted(&config, attempt + 1, started_at, max_wall_clock) {
+                    tokio::time::sleep(backoff_dur).await;
+                }
                 attempt += 1;
                 continue;
             }
@@ -151,7 +167,9 @@ pub async fn handle_nonstreaming_request(
 
                 let backoff_dur = calculate_backoff(&config, attempt, None)
                     .min(max_wall_clock.saturating_sub(started_at.elapsed()));
-                tokio::time::sleep(backoff_dur).await;
+                if another_attempt_permitted(&config, attempt + 1, started_at, max_wall_clock) {
+                    tokio::time::sleep(backoff_dur).await;
+                }
                 attempt += 1;
                 continue;
             }
@@ -200,7 +218,9 @@ pub async fn handle_nonstreaming_request(
                 );
                 let backoff_dur = calculate_backoff(&config, attempt, cause.retry_after())
                     .min(max_wall_clock.saturating_sub(started_at.elapsed()));
-                tokio::time::sleep(backoff_dur).await;
+                if another_attempt_permitted(&config, attempt + 1, started_at, max_wall_clock) {
+                    tokio::time::sleep(backoff_dur).await;
+                }
                 attempt += 1;
                 continue;
             }

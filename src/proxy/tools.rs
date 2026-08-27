@@ -14,13 +14,26 @@ pub struct ToolCallAccumulator {
 #[derive(Debug, Default)]
 pub struct ToolCallsBuffer {
     calls: BTreeMap<usize, ToolCallAccumulator>,
+    /// Cap on the assembled arguments of any single call. A malfunctioning
+    /// upstream can stream argument fragments indefinitely; nothing else bounds
+    /// them, since they never reach `accumulated_text`.
+    max_arguments_bytes: usize,
+    truncated: bool,
 }
 
 impl ToolCallsBuffer {
-    pub fn new() -> Self {
+    pub fn new(max_arguments_bytes: usize) -> Self {
         Self {
             calls: BTreeMap::new(),
+            max_arguments_bytes,
+            truncated: false,
         }
+    }
+
+    /// True once any call's arguments hit the cap; the assembled call is then
+    /// certainly invalid JSON and must not be presented as a usable call.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     pub fn is_empty(&self) -> bool {
@@ -58,7 +71,13 @@ impl ToolCallsBuffer {
                     entry.function_name = Some(cur);
                 }
                 if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                    entry.function_arguments.push_str(args);
+                    if entry.function_arguments.len().saturating_add(args.len())
+                        > self.max_arguments_bytes
+                    {
+                        self.truncated = true;
+                    } else {
+                        entry.function_arguments.push_str(args);
+                    }
                 }
             }
         }
@@ -118,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_buffering_and_assembly() {
-        let mut buffer = ToolCallsBuffer::new();
+        let mut buffer = ToolCallsBuffer::new(4 * 1024 * 1024);
 
         let delta1 = serde_json::json!([
             {

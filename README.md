@@ -77,11 +77,13 @@ Configuration is loaded from `--config <path>`, `$LLM_PROXY_CONFIG`, or defaults
 [server]
 bind = "127.0.0.1:8787"
 max_body_bytes = 33554432           # 32 MiB (axum's 2 MiB default rejects long conversations)
+allowed_origins = []                # browser origins; empty means no CORS headers at all
 
 [upstream]
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key_env = "GEMINI_API_KEY"     # Read key from this environment variable
 connect_timeout_secs = 10
+max_response_bytes = 33554432
 
 [resume]
 enabled = true
@@ -98,9 +100,11 @@ first_chunk_timeout_secs = 120
 idle_timeout_secs = 45
 resume_on_length_finish = false
 max_no_progress_attempts = 3
+max_accumulated_bytes = 33554432
 
 [tools]
 buffer_tool_calls = true
+max_tool_call_bytes = 4194304
 disable_resume_for_tool_responses = false
 
 [log]

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -27,6 +27,7 @@ use tracing::{error, warn};
 use crate::config::{build_upstream_url, Config};
 use crate::error::{parse_retry_after, ApiError};
 use crate::proxy::nonstream::handle_nonstreaming_request;
+use crate::proxy::read_body_limited;
 use crate::proxy::stream::{calculate_backoff, handle_streaming_request};
 
 #[derive(Clone)]
@@ -43,16 +44,43 @@ pub fn create_app(config: Arc<Config>) -> Router {
         .expect("Failed to build HTTP client");
 
     let max_body_bytes = config.server.max_body_bytes;
+    let allowed_origins = config.server.allowed_origins.clone();
     let state = AppState { config, client };
 
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .fallback(not_found_handler)
-        .layer(DefaultBodyLimit::max(max_body_bytes))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(max_body_bytes));
+
+    // No CORS headers unless origins are configured. Desktop clients such as
+    // Jan.ai issue native HTTP requests and send no `Origin`, so they need none;
+    // emitting permissive headers would only let any page a browser happens to
+    // load spend the configured account's quota through this listener.
+    if !allowed_origins.is_empty() {
+        let origins: Vec<HeaderValue> = allowed_origins
+            .iter()
+            .filter_map(|origin| match origin.parse::<HeaderValue>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    warn!(origin = %origin, "Ignoring unparseable allowed_origins entry");
+                    None
+                }
+            })
+            .collect();
+
+        if !origins.is_empty() {
+            router = router.layer(
+                CorsLayer::new()
+                    .allow_origin(origins)
+                    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+            );
+        }
+    }
+
+    router.with_state(state)
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -104,10 +132,13 @@ async fn models_handler(State(state): State<AppState>) -> Response {
                         .cloned()
                         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
                     let retry_after = parse_retry_after(resp.headers());
-                    match tokio::time::timeout(remaining(), resp.bytes()).await {
+                    let max_bytes = state.config.upstream.max_response_bytes;
+                    match tokio::time::timeout(remaining(), read_body_limited(resp, max_bytes))
+                        .await
+                    {
                         Ok(Ok(bytes)) => (status, content_type, retry_after, bytes),
                         Ok(Err(e)) => {
-                            last_error = Some((StatusCode::BAD_GATEWAY, e.to_string()));
+                            last_error = Some((StatusCode::BAD_GATEWAY, e.clone()));
                             warn!(error = %e, "Models endpoint body read failed");
                             if attempt == 1 && !remaining().is_zero() {
                                 sleep_before_models_retry(&state, attempt, None, remaining()).await;

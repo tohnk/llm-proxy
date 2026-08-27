@@ -15,6 +15,7 @@ use crate::proxy::chunks::{
 };
 use crate::proxy::consume::{consume_upstream_stream, StreamConsumerState, StreamTiming};
 use crate::proxy::continuation::build_continuation_request;
+use crate::proxy::read_body_limited;
 
 pub struct ResponseState {
     pub downstream_id: String,
@@ -280,7 +281,13 @@ pub async fn handle_streaming_request(
                     backoff_ms = backoff_dur.as_millis(),
                     "Retrying after backoff"
                 );
-                if !sleep_with_keepalive(backoff_dur, &downstream_tx).await {
+                if another_attempt_permitted(
+                    &config,
+                    state.attempt + 1,
+                    state.started_at,
+                    &failures,
+                ) && !sleep_with_keepalive(backoff_dur, &downstream_tx).await
+                {
                     info!(downstream_id = %state.downstream_id, "Client disconnected during retry backoff");
                     return;
                 }
@@ -302,7 +309,13 @@ pub async fn handle_streaming_request(
                 );
                 let backoff_dur = calculate_backoff(&config, state.attempt, cause.retry_after())
                     .min(max_wall_clock.saturating_sub(state.started_at.elapsed()));
-                if !sleep_with_keepalive(backoff_dur, &downstream_tx).await {
+                if another_attempt_permitted(
+                    &config,
+                    state.attempt + 1,
+                    state.started_at,
+                    &failures,
+                ) && !sleep_with_keepalive(backoff_dur, &downstream_tx).await
+                {
                     info!(downstream_id = %state.downstream_id, "Client disconnected during retry backoff");
                     return;
                 }
@@ -317,7 +330,7 @@ pub async fn handle_streaming_request(
             let body_result = tokio::select! {
                 result = tokio::time::timeout(
                     max_wall_clock.saturating_sub(state.started_at.elapsed()),
-                    response.text(),
+                    read_body_limited(response, config.upstream.max_response_bytes),
                 ) => result,
                 _ = downstream_tx.closed() => {
                     info!(downstream_id = %state.downstream_id, "Client disconnected while reading upstream error");
@@ -325,7 +338,7 @@ pub async fn handle_streaming_request(
                 }
             };
             let body_text = match body_result {
-                Ok(Ok(body)) => body,
+                Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
                 Ok(Err(e)) => {
                     failures.record(
                         "error-body-read",
@@ -341,7 +354,13 @@ pub async fn handle_streaming_request(
                     );
                     let backoff_dur = calculate_backoff(&config, state.attempt, None)
                         .min(max_wall_clock.saturating_sub(state.started_at.elapsed()));
-                    if !sleep_with_keepalive(backoff_dur, &downstream_tx).await {
+                    if another_attempt_permitted(
+                        &config,
+                        state.attempt + 1,
+                        state.started_at,
+                        &failures,
+                    ) && !sleep_with_keepalive(backoff_dur, &downstream_tx).await
+                    {
                         info!(downstream_id = %state.downstream_id, "Client disconnected during retry backoff");
                         return;
                     }
@@ -365,7 +384,13 @@ pub async fn handle_streaming_request(
                     );
                     let backoff_dur = calculate_backoff(&config, state.attempt, None)
                         .min(max_wall_clock.saturating_sub(state.started_at.elapsed()));
-                    if !sleep_with_keepalive(backoff_dur, &downstream_tx).await {
+                    if another_attempt_permitted(
+                        &config,
+                        state.attempt + 1,
+                        state.started_at,
+                        &failures,
+                    ) && !sleep_with_keepalive(backoff_dur, &downstream_tx).await
+                    {
                         info!(downstream_id = %state.downstream_id, "Client disconnected during retry backoff");
                         return;
                     }
@@ -407,7 +432,13 @@ pub async fn handle_streaming_request(
                         backoff_ms = backoff_dur.as_millis(),
                         "Retrying after backoff"
                     );
-                    if !sleep_with_keepalive(backoff_dur, &downstream_tx).await {
+                    if another_attempt_permitted(
+                        &config,
+                        state.attempt + 1,
+                        state.started_at,
+                        &failures,
+                    ) && !sleep_with_keepalive(backoff_dur, &downstream_tx).await
+                    {
                         info!(downstream_id = %state.downstream_id, "Client disconnected during retry backoff");
                         return;
                     }
@@ -544,7 +575,13 @@ pub async fn handle_streaming_request(
                     "Backing off before resumption"
                 );
 
-                if !sleep_with_keepalive(backoff_dur, &downstream_tx).await {
+                if another_attempt_permitted(
+                    &config,
+                    state.attempt + 1,
+                    state.started_at,
+                    &failures,
+                ) && !sleep_with_keepalive(backoff_dur, &downstream_tx).await
+                {
                     info!(downstream_id = %state.downstream_id, "Client disconnected during retry backoff");
                     return;
                 }
@@ -582,6 +619,23 @@ pub async fn handle_streaming_request(
 /// its own, and giving up early wastes a budget that was meant to absorb it.
 /// The moment any other kind of failure appears, the normal ceiling returns.
 /// Takes the larger of the two so the setting can only ever extend.
+/// Whether another attempt is actually permitted after the current failure.
+///
+/// The give-up checks live at the top of the loop, so without this the last
+/// failed attempt sleeps out a full backoff — up to `backoff_max_ms` — before
+/// discovering it had no retry left. Observed costing 20s of dead waiting at the
+/// end of an already-doomed request.
+fn another_attempt_permitted(
+    config: &Config,
+    next_attempt: u32,
+    started_at: Instant,
+    failures: &FailureTracker,
+) -> bool {
+    next_attempt <= config.resume.max_attempts
+        && !failures.is_stalled(config.resume.max_no_progress_attempts)
+        && started_at.elapsed() < effective_wall_clock(config, failures.congestion_only())
+}
+
 pub fn effective_wall_clock(config: &Config, congestion_only: bool) -> Duration {
     let normal = Duration::from_secs(config.resume.max_wall_clock_secs);
     if congestion_only {

@@ -2,10 +2,10 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use llm_proxy::config::Config;
+use llm_proxy::config::{redact_url, Config};
 use llm_proxy::create_app;
 
 #[derive(Parser, Debug)]
@@ -39,9 +39,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // `log_bodies` only gates `trace!` calls; the filter still has to admit them.
+    if config.log.log_bodies
+        && std::env::var("RUST_LOG").is_err()
+        && !config.log.level.eq_ignore_ascii_case("trace")
+    {
+        warn!(
+            log_level = %config.log.level,
+            "log_bodies is enabled but the log level will filter the body traces out. \
+             Run with RUST_LOG=llm_proxy=trace, or set log.level = \"trace\"."
+        );
+    }
+
     info!(
         bind = %config.server.bind,
-        upstream = %config.upstream.base_url,
+        upstream = %redact_url(&config.upstream.base_url),
         resume_enabled = config.resume.enabled,
         resume_mode = ?config.resume.mode,
         max_attempts = config.resume.max_attempts,

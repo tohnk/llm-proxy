@@ -49,6 +49,7 @@ impl std::str::FromStr for ContinuationMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -59,6 +60,15 @@ pub struct ServerConfig {
     /// than resource exhaustion, since the proxy binds to loopback by default.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Browser origins permitted to call this proxy. Empty (the default) sends
+    /// no CORS headers at all.
+    ///
+    /// Jan.ai and other desktop clients issue native HTTP requests with no
+    /// `Origin`, so they need nothing here. Permissive CORS would only widen the
+    /// surface: it would let any web page you happen to visit spend the
+    /// configured account's quota through your loopback listener.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -74,11 +84,13 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             max_body_bytes: default_max_body_bytes(),
+            allowed_origins: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
@@ -88,6 +100,11 @@ pub struct UpstreamConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// Cap on a non-streaming or `/v1/models` response body, and on an error
+    /// body read before classification. Timeouts bound how long an upstream may
+    /// take, not how much it may send.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
 }
 
 fn default_base_url() -> String {
@@ -101,6 +118,9 @@ fn default_api_key_env() -> String {
 fn default_connect_timeout_secs() -> u64 {
     10
 }
+fn default_max_response_bytes() -> usize {
+    32 * 1024 * 1024
+}
 
 impl Default for UpstreamConfig {
     fn default() -> Self {
@@ -109,11 +129,13 @@ impl Default for UpstreamConfig {
             api_key_env: default_api_key_env(),
             api_key: None,
             connect_timeout_secs: default_connect_timeout_secs(),
+            max_response_bytes: default_max_response_bytes(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResumeConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -149,6 +171,13 @@ pub struct ResumeConfig {
     /// emitting nothing new (§7.5). Congestion is exempt. 0 disables the check.
     #[serde(default = "default_max_no_progress_attempts")]
     pub max_no_progress_attempts: u32,
+    /// Cap on the text accumulated across all attempts of one response.
+    ///
+    /// Deliberately far above any real generation — 32 MiB is on the order of
+    /// eight million tokens — so it protects memory against a runaway or
+    /// malicious upstream without ever truncating legitimate long output.
+    #[serde(default = "default_max_accumulated_bytes")]
+    pub max_accumulated_bytes: usize,
 }
 
 fn default_true() -> bool {
@@ -187,6 +216,9 @@ fn default_idle_timeout_secs() -> u64 {
 fn default_max_no_progress_attempts() -> u32 {
     3
 }
+fn default_max_accumulated_bytes() -> usize {
+    32 * 1024 * 1024
+}
 
 impl Default for ResumeConfig {
     fn default() -> Self {
@@ -205,16 +237,25 @@ impl Default for ResumeConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             resume_on_length_finish: false,
             max_no_progress_attempts: default_max_no_progress_attempts(),
+            max_accumulated_bytes: default_max_accumulated_bytes(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
     #[serde(default = "default_true")]
     pub buffer_tool_calls: bool,
     #[serde(default)]
     pub disable_resume_for_tool_responses: bool,
+    /// Cap on the assembled arguments of a single buffered tool call.
+    #[serde(default = "default_max_tool_call_bytes")]
+    pub max_tool_call_bytes: usize,
+}
+
+fn default_max_tool_call_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 impl Default for ToolsConfig {
@@ -222,11 +263,13 @@ impl Default for ToolsConfig {
         Self {
             buffer_tool_calls: true,
             disable_resume_for_tool_responses: false,
+            max_tool_call_bytes: default_max_tool_call_bytes(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -248,6 +291,7 @@ impl Default for LogConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -270,9 +314,15 @@ impl Config {
     }
 
     pub fn load(explicit_path: Option<&Path>) -> Result<Self, ConfigError> {
-        let (config_path, is_explicit) = match explicit_path {
-            Some(p) => (expand_path(p), true),
-            None => (Self::default_config_path(), false),
+        // A path named through `$LLM_PROXY_CONFIG` was chosen deliberately, so a
+        // typo in it must fail loudly rather than silently routing traffic to
+        // the built-in default upstream. Only the implicit default path may fall
+        // back to `Config::default()`.
+        let env_path = env::var("LLM_PROXY_CONFIG").ok().map(|p| expand_tilde(&p));
+        let (config_path, is_explicit) = match (explicit_path, env_path) {
+            (Some(p), _) => (expand_path(p), true),
+            (None, Some(p)) => (p, true),
+            (None, None) => (expand_tilde("~/.config/llm-proxy/llm-proxy.toml"), false),
         };
 
         let mut config = if config_path.exists() {
@@ -301,16 +351,23 @@ impl Config {
         Ok(config)
     }
 
+    /// Resolve the upstream key, trimmed.
+    ///
+    /// Surrounding whitespace is stripped rather than merely tested for: a key
+    /// read from a file or a here-doc usually carries a trailing newline, which
+    /// is not a legal HTTP header value and fails at request time.
     pub fn get_upstream_api_key(&self) -> Option<String> {
-        if let Some(ref key) = self.upstream.api_key {
-            if !key.trim().is_empty() {
-                return Some(key.clone());
+        if let Some(key) = self.upstream.api_key.as_deref() {
+            let key = key.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
             }
         }
         if !self.upstream.api_key_env.is_empty() {
             if let Ok(val) = env::var(&self.upstream.api_key_env) {
-                if !val.trim().is_empty() {
-                    return Some(val);
+                let val = val.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
                 }
             }
         }
@@ -338,6 +395,33 @@ impl Config {
         }
         if let Ok(val) = env::var("LLM_PROXY_UPSTREAM_API_KEY") {
             self.upstream.api_key = Some(val);
+        }
+        if let Ok(val) = env::var("LLM_PROXY_SERVER_ALLOWED_ORIGINS") {
+            self.server.allowed_origins = val
+                .split(',')
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect();
+        }
+        if let Ok(val) = env::var("LLM_PROXY_UPSTREAM_MAX_RESPONSE_BYTES") {
+            self.upstream.max_response_bytes =
+                val.parse().map_err(|_| ConfigError::EnvOverride {
+                    key: "LLM_PROXY_UPSTREAM_MAX_RESPONSE_BYTES".to_string(),
+                    val,
+                })?;
+        }
+        if let Ok(val) = env::var("LLM_PROXY_RESUME_MAX_ACCUMULATED_BYTES") {
+            self.resume.max_accumulated_bytes =
+                val.parse().map_err(|_| ConfigError::EnvOverride {
+                    key: "LLM_PROXY_RESUME_MAX_ACCUMULATED_BYTES".to_string(),
+                    val,
+                })?;
+        }
+        if let Ok(val) = env::var("LLM_PROXY_TOOLS_MAX_TOOL_CALL_BYTES") {
+            self.tools.max_tool_call_bytes = val.parse().map_err(|_| ConfigError::EnvOverride {
+                key: "LLM_PROXY_TOOLS_MAX_TOOL_CALL_BYTES".to_string(),
+                val,
+            })?;
         }
         if let Ok(val) = env::var("LLM_PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS") {
             self.upstream.connect_timeout_secs =
@@ -503,6 +587,34 @@ pub fn build_upstream_url(base_url: &str, path: &str) -> String {
             format!("{base}/{path}")
         }
     }
+}
+
+/// Strip credentials from a URL so it can be logged.
+///
+/// Some providers carry the key in the query string (`?key=…`), and userinfo
+/// (`https://user:pass@host`) is a standard place for one. Neither belongs in a
+/// log line.
+pub fn redact_url(url: &str) -> String {
+    let (base, had_query) = match url.split_once('?') {
+        Some((base, _)) => (base, true),
+        None => (url, false),
+    };
+
+    let mut out = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            match rest[..authority_end].rfind('@') {
+                Some(at) => format!("{scheme}://<redacted>@{}", &rest[at + 1..]),
+                None => base.to_string(),
+            }
+        }
+        None => base.to_string(),
+    };
+
+    if had_query {
+        out.push_str("?<redacted>");
+    }
+    out
 }
 
 pub fn expand_path(p: &Path) -> PathBuf {
@@ -826,6 +938,84 @@ mod tests {
         // A whitespace-only value is treated as absent, not as an empty key.
         env::set_var("LLM_PROXY_TEST_KEY_SOURCE", "   ");
         assert_eq!(config.get_upstream_api_key(), None);
+    }
+
+    /// A typo in a config key must fail loudly: silently falling back to the
+    /// default for `max_attempts` or `base_url` is a security and cost problem.
+    #[test]
+    fn test_unknown_toml_keys_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [resume]
+            max_attemps = 3
+            "#,
+        )
+        .expect_err("a misspelled key should be rejected");
+        assert!(err.to_string().contains("max_attemps"), "{err}");
+
+        assert!(toml::from_str::<Config>(
+            r#"
+            [nonsense]
+            whatever = 1
+            "#,
+        )
+        .is_err());
+    }
+
+    /// A path named through `$LLM_PROXY_CONFIG` was chosen deliberately, so a
+    /// typo in it must error rather than quietly loading defaults — which would
+    /// route traffic to the built-in Gemini endpoint.
+    #[test]
+    fn test_missing_env_config_path_is_an_error() {
+        let _env = EnvVars::set(&[(
+            "LLM_PROXY_CONFIG",
+            "/nonexistent/llm-proxy/definitely-not-here.toml",
+        )]);
+        match Config::load(None) {
+            Err(ConfigError::Io { path, .. }) => {
+                assert!(path.to_string_lossy().contains("definitely-not-here"));
+            }
+            Ok(_) => panic!("a missing env-selected config must not fall back to defaults"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_api_key_is_trimmed() {
+        let mut config = Config::default();
+        // A key read from a file or here-doc carries a trailing newline, which
+        // is not a legal header value.
+        config.upstream.api_key = Some("  sk-test-key\n".to_string());
+        assert_eq!(
+            config.get_upstream_api_key(),
+            Some("sk-test-key".to_string())
+        );
+
+        config.upstream.api_key = Some("   ".to_string());
+        config.upstream.api_key_env = "LLM_PROXY_NONEXISTENT_KEY_VAR".to_string();
+        assert_eq!(config.get_upstream_api_key(), None);
+    }
+
+    #[test]
+    fn test_redact_url_strips_credentials() {
+        assert_eq!(
+            redact_url("https://generativelanguage.googleapis.com/v1beta/openai"),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(
+            redact_url("https://host/v1?key=secret-value"),
+            "https://host/v1?<redacted>"
+        );
+        assert_eq!(
+            redact_url("https://user:pass@host/v1"),
+            "https://<redacted>@host/v1"
+        );
+        assert_eq!(
+            redact_url("https://user:pass@host/v1?key=secret"),
+            "https://<redacted>@host/v1?<redacted>"
+        );
+        // An '@' in the path is not userinfo and must be left alone.
+        assert_eq!(redact_url("http://host/v1/a@b"), "http://host/v1/a@b");
     }
 
     #[test]
