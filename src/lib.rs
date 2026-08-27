@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, State},
     http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -222,10 +222,30 @@ async fn sleep_before_models_retry(
     tokio::time::sleep(backoff).await;
 }
 
+/// Map an axum body-extraction failure onto the project's error schema.
+///
+/// Malformed JSON, a wrong content type, and an oversized body are all rejected
+/// before the handler runs, and axum's own plain-text rejection bodies are not
+/// what an OpenAI-compatible client parses.
+fn json_rejection_response(rejection: JsonRejection) -> Response {
+    let status = rejection.status();
+    let mut api_err = ApiError::new(status, rejection.body_text());
+    api_err.error_type = Some("invalid_request_error".to_string());
+    (status, Json(api_err.to_openai_json())).into_response()
+}
+
 async fn chat_completions_handler(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let Json(body) = match payload {
+        Ok(json) => json,
+        Err(rejection) => {
+            warn!(status = %rejection.status(), "Rejected a malformed request body");
+            return json_rejection_response(rejection);
+        }
+    };
+
     // Refuse rather than queue: a queued request still holds its parsed body and
     // waits behind work that may run for the full wall clock.
     let permit = match Arc::clone(&state.limiter).try_acquire_owned() {

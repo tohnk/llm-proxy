@@ -19,6 +19,8 @@ pub enum ConfigError {
     },
     #[error("Invalid environment variable override for {key}: {val}")]
     EnvOverride { key: String, val: String },
+    #[error("Invalid configuration: {0}")]
+    Validation(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -358,6 +360,7 @@ impl Config {
         };
 
         config.apply_env_overrides()?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -382,6 +385,113 @@ impl Config {
             }
         }
         None
+    }
+
+    /// Reject values that parse but cannot work.
+    ///
+    /// Every field here is individually well-typed, so serde and the env
+    /// overrides both accept nonsense: `max_attempts = 0` produces an empty
+    /// successful stream without ever contacting the upstream, a non-finite
+    /// multiplier propagates NaN into the backoff, and a malformed `base_url`
+    /// fails identically on every attempt until the retry budget is gone.
+    /// Failing at startup turns all of those into one clear message.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |msg: String| Err(ConfigError::Validation(msg));
+
+        if self.resume.max_attempts == 0 {
+            return invalid("resume.max_attempts must be at least 1".into());
+        }
+        if self.server.max_concurrent_requests == 0 {
+            return invalid("server.max_concurrent_requests must be at least 1".into());
+        }
+
+        for (name, value) in [
+            ("server.max_body_bytes", self.server.max_body_bytes),
+            (
+                "upstream.max_response_bytes",
+                self.upstream.max_response_bytes,
+            ),
+            ("resume.dedup_window_chars", self.resume.dedup_window_chars),
+            (
+                "resume.max_accumulated_bytes",
+                self.resume.max_accumulated_bytes,
+            ),
+            ("tools.max_tool_call_bytes", self.tools.max_tool_call_bytes),
+        ] {
+            if value == 0 {
+                return invalid(format!("{name} must be greater than 0"));
+            }
+        }
+
+        // A day is far past any sane setting and keeps deadline arithmetic well
+        // clear of `Instant` overflow.
+        const MAX_SECS: u64 = 86_400;
+        for (name, value) in [
+            (
+                "upstream.connect_timeout_secs",
+                self.upstream.connect_timeout_secs,
+            ),
+            (
+                "resume.max_wall_clock_secs",
+                self.resume.max_wall_clock_secs,
+            ),
+            (
+                "resume.overloaded_max_wall_clock_secs",
+                self.resume.overloaded_max_wall_clock_secs,
+            ),
+            (
+                "resume.first_chunk_timeout_secs",
+                self.resume.first_chunk_timeout_secs,
+            ),
+            ("resume.idle_timeout_secs", self.resume.idle_timeout_secs),
+        ] {
+            if value == 0 {
+                return invalid(format!("{name} must be greater than 0"));
+            }
+            if value > MAX_SECS {
+                return invalid(format!("{name} must be at most {MAX_SECS} seconds"));
+            }
+        }
+
+        if self.resume.backoff_initial_ms == 0 || self.resume.backoff_max_ms == 0 {
+            return invalid("resume backoff durations must be greater than 0".into());
+        }
+        if self.resume.backoff_max_ms < self.resume.backoff_initial_ms {
+            return invalid(
+                "resume.backoff_max_ms must be at least resume.backoff_initial_ms".into(),
+            );
+        }
+        if !self.resume.backoff_multiplier.is_finite() || self.resume.backoff_multiplier < 1.0 {
+            return invalid("resume.backoff_multiplier must be finite and at least 1.0".into());
+        }
+        if !self.resume.backoff_jitter.is_finite()
+            || !(0.0..=1.0).contains(&self.resume.backoff_jitter)
+        {
+            return invalid("resume.backoff_jitter must be between 0.0 and 1.0".into());
+        }
+
+        if self.upstream.base_url.trim().is_empty() {
+            return invalid("upstream.base_url must not be empty".into());
+        }
+        let url = reqwest::Url::parse(&self.upstream.base_url)
+            .map_err(|e| ConfigError::Validation(format!("upstream.base_url is not a URL: {e}")))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return invalid(format!(
+                "upstream.base_url scheme must be http or https, got '{}'",
+                url.scheme()
+            ));
+        }
+
+        if let Some(key) = self.get_upstream_api_key() {
+            if reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
+                return invalid(
+                    "the upstream API key contains characters that cannot be sent in a header"
+                        .into(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
@@ -1033,6 +1143,86 @@ mod tests {
         );
         // An '@' in the path is not userinfo and must be left alone.
         assert_eq!(redact_url("http://host/v1/a@b"), "http://host/v1/a@b");
+    }
+
+    /// Values that parse but cannot work must be refused at startup rather than
+    /// producing nonsense at request time.
+    #[test]
+    fn test_validate_rejects_unusable_values() {
+        type Mutate = Box<dyn Fn(&mut Config)>;
+        let cases: Vec<(&str, Mutate)> = vec![
+            (
+                "max_attempts",
+                Box::new(|c: &mut Config| c.resume.max_attempts = 0),
+            ),
+            (
+                "max_concurrent_requests",
+                Box::new(|c: &mut Config| c.server.max_concurrent_requests = 0),
+            ),
+            (
+                "dedup_window_chars",
+                Box::new(|c: &mut Config| c.resume.dedup_window_chars = 0),
+            ),
+            (
+                "max_body_bytes",
+                Box::new(|c: &mut Config| c.server.max_body_bytes = 0),
+            ),
+            (
+                "idle_timeout_secs",
+                Box::new(|c: &mut Config| c.resume.idle_timeout_secs = 0),
+            ),
+            (
+                "max_wall_clock_secs",
+                Box::new(|c: &mut Config| c.resume.max_wall_clock_secs = 999_999_999),
+            ),
+            (
+                "backoff_multiplier",
+                Box::new(|c: &mut Config| c.resume.backoff_multiplier = f64::NAN),
+            ),
+            (
+                "backoff_multiplier",
+                Box::new(|c: &mut Config| c.resume.backoff_multiplier = 0.5),
+            ),
+            (
+                "backoff_jitter",
+                Box::new(|c: &mut Config| c.resume.backoff_jitter = f64::INFINITY),
+            ),
+            (
+                "backoff_jitter",
+                Box::new(|c: &mut Config| c.resume.backoff_jitter = 2.0),
+            ),
+            (
+                "backoff_max_ms",
+                Box::new(|c: &mut Config| {
+                    c.resume.backoff_initial_ms = 5_000;
+                    c.resume.backoff_max_ms = 100;
+                }),
+            ),
+            (
+                "base_url",
+                Box::new(|c: &mut Config| c.upstream.base_url = "not a url".to_string()),
+            ),
+            (
+                "base_url scheme",
+                Box::new(|c: &mut Config| c.upstream.base_url = "ftp://host/v1".to_string()),
+            ),
+            (
+                "api key header",
+                Box::new(|c: &mut Config| c.upstream.api_key = Some("bad\nkey".to_string())),
+            ),
+        ];
+
+        for (label, mutate) in cases {
+            let mut config = Config::default();
+            mutate(&mut config);
+            assert!(
+                matches!(config.validate(), Err(ConfigError::Validation(_))),
+                "{label} should have been rejected"
+            );
+        }
+
+        // The shipped defaults must of course pass.
+        assert!(Config::default().validate().is_ok());
     }
 
     #[test]

@@ -2695,3 +2695,62 @@ async fn test_accumulated_text_cap_ends_the_stream() {
     );
     assert_eq!(result.done_count, 1);
 }
+
+// §5 / M13: body-extraction failures happen before the handler runs, and axum's
+// own plain-text rejections are not what an OpenAI-compatible client parses.
+#[tokio::test]
+async fn test_malformed_request_bodies_get_openai_shaped_errors() {
+    let harness = TestHarness::setup(|config| {
+        config.upstream.base_url = format!("{}/chat/completions", config.upstream.base_url);
+        config.server.max_body_bytes = 4096;
+    })
+    .await;
+    let url = format!("http://{}/v1/chat/completions", harness.proxy_addr);
+
+    // Malformed JSON.
+    let resp = harness
+        .client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("rejection must still be JSON");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"].is_string());
+
+    // Wrong content type.
+    let resp = harness
+        .client
+        .post(&url)
+        .header("content-type", "text/plain")
+        .body("{\"model\":\"m\"}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "a JSON body must be declared as JSON"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    // Oversized body.
+    let resp = harness
+        .client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "x".repeat(64 * 1024)}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value = resp.json().await.expect("413 must be OpenAI-shaped too");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}

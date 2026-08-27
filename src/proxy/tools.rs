@@ -36,6 +36,39 @@ impl ToolCallsBuffer {
         self.truncated
     }
 
+    /// Check that every buffered call is actually usable.
+    ///
+    /// A client is expected to execute these calls and echo the `id` back, so
+    /// inventing a placeholder id, an empty function name, or forwarding
+    /// arguments that are not valid JSON produces a call that cannot be run —
+    /// and duplicate placeholder ids collide when several calls are incomplete.
+    /// A finished-looking but unusable call is a failed generation, and §7.4
+    /// already knows what to do with one.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.truncated {
+            return Err("tool call arguments exceeded the configured limit".to_string());
+        }
+        for entry in self.calls.values() {
+            let index = entry.index;
+            match entry.id.as_deref() {
+                Some(id) if !id.trim().is_empty() => {}
+                _ => return Err(format!("tool call {index} has no id")),
+            }
+            match entry.function_name.as_deref() {
+                Some(name) if !name.trim().is_empty() => {}
+                _ => return Err(format!("tool call {index} has no function name")),
+            }
+            // Empty arguments are accepted: some providers omit them entirely
+            // for a no-argument function. Anything present must parse.
+            if !entry.function_arguments.trim().is_empty()
+                && serde_json::from_str::<Value>(&entry.function_arguments).is_err()
+            {
+                return Err(format!("tool call {index} has malformed arguments"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.calls.is_empty()
     }
@@ -99,10 +132,10 @@ impl ToolCallsBuffer {
         for entry in self.calls.values() {
             let tc_obj = serde_json::json!({
                 "index": entry.index,
-                "id": entry.id.as_deref().unwrap_or("call_0"),
+                "id": entry.id.as_deref().unwrap_or_default(),
                 "type": entry.call_type.as_deref().unwrap_or("function"),
                 "function": {
-                    "name": entry.function_name.as_deref().unwrap_or(""),
+                    "name": entry.function_name.as_deref().unwrap_or_default(),
                     "arguments": entry.function_arguments
                 }
             });

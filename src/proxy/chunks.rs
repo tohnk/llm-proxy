@@ -2,45 +2,62 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Usage reported by the upstream, kept coherent across attempts.
+///
+/// Upstream usage is cumulative *within* one attempt, so merging fields
+/// individually across attempts produced objects that never existed: a
+/// `prompt_tokens` from attempt two beside a `completion_tokens` from attempt
+/// four. Whole snapshots are stored instead, which also preserves detail fields
+/// (`prompt_tokens_details`, cached and reasoning token counts) that a
+/// field-by-field copy discarded.
+///
+/// What is reported downstream is the **final attempt's** snapshot — the same
+/// numbers an unproxied request would have returned. The cross-attempt total is
+/// tracked separately and logged, since only the proxy knows how much was
+/// actually billed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UsageAccumulator {
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
+    /// Usage seen so far in the attempt currently running.
+    attempt: Option<Value>,
+    /// The last completed attempt's snapshot; this is what goes downstream.
+    reported: Option<Value>,
+    billed_prompt_tokens: u64,
+    billed_completion_tokens: u64,
+}
+
+fn usage_field(usage: &Value, key: &str) -> u64 {
+    usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
 impl UsageAccumulator {
+    /// Record the usage object from one upstream chunk, replacing rather than
+    /// merging: within an attempt these values are cumulative.
     pub fn update_from_json(&mut self, usage_val: &Value) {
-        if let Some(prompt) = usage_val.get("prompt_tokens").and_then(|v| v.as_u64()) {
-            self.prompt_tokens = Some(prompt);
-        }
-        if let Some(completion) = usage_val.get("completion_tokens").and_then(|v| v.as_u64()) {
-            self.completion_tokens = Some(completion);
-        }
-        if let Some(total) = usage_val.get("total_tokens").and_then(|v| v.as_u64()) {
-            self.total_tokens = Some(total);
+        if usage_val.is_object() {
+            self.attempt = Some(usage_val.clone());
         }
     }
 
-    pub fn to_json(&self) -> Option<Value> {
-        if self.prompt_tokens.is_some()
-            || self.completion_tokens.is_some()
-            || self.total_tokens.is_some()
-        {
-            let mut obj = serde_json::Map::new();
-            if let Some(p) = self.prompt_tokens {
-                obj.insert("prompt_tokens".to_string(), Value::from(p));
-            }
-            if let Some(c) = self.completion_tokens {
-                obj.insert("completion_tokens".to_string(), Value::from(c));
-            }
-            if let Some(t) = self.total_tokens {
-                obj.insert("total_tokens".to_string(), Value::from(t));
-            }
-            Some(Value::Object(obj))
-        } else {
-            None
+    /// Close out the current attempt, adding its usage to the billed total.
+    pub fn commit_attempt(&mut self) {
+        if let Some(usage) = self.attempt.take() {
+            self.billed_prompt_tokens = self
+                .billed_prompt_tokens
+                .saturating_add(usage_field(&usage, "prompt_tokens"));
+            self.billed_completion_tokens = self
+                .billed_completion_tokens
+                .saturating_add(usage_field(&usage, "completion_tokens"));
+            self.reported = Some(usage);
         }
+    }
+
+    /// Tokens actually spent upstream across every attempt.
+    pub fn billed(&self) -> (u64, u64) {
+        (self.billed_prompt_tokens, self.billed_completion_tokens)
+    }
+
+    pub fn to_json(&self) -> Option<Value> {
+        self.reported.clone().or_else(|| self.attempt.clone())
     }
 }
 
@@ -127,6 +144,82 @@ pub fn build_chunk_with_reasoning(
 /// a single upstream event may carry `content` and `reasoning` alongside
 /// `tool_calls`, and those fields are emitted by their own branches. Forwarding
 /// the mixed source object would send them twice.
+/// Build a chunk carrying a single named delta field of string type.
+///
+/// Used for `reasoning_content` / `reasoning` and for `refusal`, which share a
+/// shape but are distinct fields on the wire.
+pub fn build_chunk_with_delta_field(
+    downstream_id: &str,
+    created: i64,
+    model: &str,
+    field_name: &str,
+    value: &str,
+    include_role: bool,
+) -> Value {
+    let mut delta = serde_json::Map::new();
+    if include_role {
+        delta.insert("role".to_string(), Value::String("assistant".to_string()));
+    }
+    delta.insert(field_name.to_string(), Value::String(value.to_string()));
+
+    serde_json::json!({
+        "id": downstream_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": Value::Null
+            }
+        ]
+    })
+}
+
+/// Forward the upstream chunk itself, keeping fields the proxy does not model —
+/// `logprobs`, `system_fingerprint`, `service_tier`, provider extensions such as
+/// Gemini's `extra_content` — instead of rebuilding a minimal chunk from
+/// scratch (§6.5).
+///
+/// Only valid when the delta was not rewritten: if dedup shortened the text, or
+/// the delta carries more than one payload field, the surrounding metadata no
+/// longer describes what is being sent and a rebuilt chunk is correct instead.
+pub fn passthrough_upstream_chunk(
+    source: &Value,
+    downstream_id: &str,
+    created: i64,
+    model: &str,
+    emitted_role: &mut bool,
+) -> Value {
+    let mut outgoing = source.clone();
+    rewrite_upstream_chunk(
+        &mut outgoing,
+        downstream_id,
+        created,
+        model,
+        emitted_role,
+        false,
+    );
+
+    // `rewrite_upstream_chunk` only manages a role the upstream supplied; the
+    // first downstream chunk must carry one regardless (§6.5).
+    if !*emitted_role {
+        if let Some(delta) = outgoing
+            .get_mut("choices")
+            .and_then(|c| c.as_array_mut())
+            .and_then(|c| c.first_mut())
+            .and_then(|c| c.get_mut("delta"))
+            .and_then(|d| d.as_object_mut())
+        {
+            delta.insert("role".to_string(), Value::String("assistant".to_string()));
+            *emitted_role = true;
+        }
+    }
+
+    outgoing
+}
+
 pub fn build_chunk_with_tool_calls(
     downstream_id: &str,
     created: i64,
@@ -234,6 +327,8 @@ pub fn rewrite_upstream_chunk(
 pub struct ParsedChunkDetails {
     pub has_role: bool,
     pub content: Option<String>,
+    /// OpenAI's `delta.refusal`: a model refusal delivered in place of content.
+    pub refusal: Option<String>,
     pub reasoning: Option<String>,
     pub reasoning_field: Option<String>,
     pub tool_calls: Option<Vec<Value>>,
@@ -266,6 +361,12 @@ pub fn parse_chunk_details(chunk_json: &Value) -> ParsedChunkDetails {
                 if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                     if !content.is_empty() {
                         details.content = Some(content.to_string());
+                    }
+                }
+
+                if let Some(refusal) = delta.get("refusal").and_then(|r| r.as_str()) {
+                    if !refusal.is_empty() {
+                        details.refusal = Some(refusal.to_string());
                     }
                 }
 

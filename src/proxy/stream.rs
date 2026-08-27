@@ -26,6 +26,8 @@ pub struct ResponseState {
     /// Reasoning already shown to the client. Deduplicated across attempts like
     /// content, but never included in continuation `messages` (§9).
     pub accumulated_reasoning: String,
+    /// Refusal text already shown to the client, deduplicated like reasoning.
+    pub accumulated_refusal: String,
     /// Payload frames delivered downstream across all attempts. Content is not
     /// the only thing the client can have received, so give-up and no-progress
     /// decisions key off this rather than `accumulated_text`.
@@ -58,6 +60,7 @@ impl ResponseState {
             model_frozen: false,
             accumulated_text: String::new(),
             accumulated_reasoning: String::new(),
+            accumulated_refusal: String::new(),
             emitted_payloads: 0,
             emitted_role: false,
             attempt: 1,
@@ -495,6 +498,7 @@ pub async fn handle_streaming_request(
             model_frozen: &mut state.model_frozen,
             accumulated_text: &mut state.accumulated_text,
             accumulated_reasoning: &mut state.accumulated_reasoning,
+            accumulated_refusal: &mut state.accumulated_refusal,
             emitted_payloads: &mut state.emitted_payloads,
             emitted_role: &mut state.emitted_role,
             usage: &mut state.usage,
@@ -524,6 +528,10 @@ pub async fn handle_streaming_request(
             }
         };
 
+        // Close the attempt's usage snapshot before it is reported or a new
+        // attempt starts (§6.1).
+        state.usage.commit_attempt();
+
         match outcome {
             AttemptOutcome::Terminal(finish_reason) => {
                 let finish_chunk = build_chunk_with_finish(
@@ -542,6 +550,8 @@ pub async fn handle_streaming_request(
                     total_duration_secs = state.started_at.elapsed().as_secs(),
                     emitted_chars = state.accumulated_text.chars().count(),
                     emitted_payloads = state.emitted_payloads,
+                    billed_prompt_tokens = state.usage.billed().0,
+                    billed_completion_tokens = state.usage.billed().1,
                     finish_reason = %finish_reason,
                     "Streaming request completed successfully"
                 );

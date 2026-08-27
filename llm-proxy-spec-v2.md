@@ -44,6 +44,12 @@ streaming responses survive transient upstream failures.
 > 19. Reasoning is **deduplicated** across attempts, and "nothing emitted" counts every
 >     payload, not only content (§9, §7).
 > 20. Downstream sends are **deadline-bounded**, and admission is **capped** (§4, §11).
+> 21. `delta.refusal` is **forwarded** and counts as output (§9).
+> 22. Untrimmed single-field chunks are **passed through**, keeping upstream metadata (§6.5).
+> 23. Configuration is **validated** at startup, and body-extraction failures are
+>     **OpenAI-shaped** (§4, §5).
+> 24. Reported usage is one attempt's **coherent snapshot**, not a blend (§6.1).
+> 25. An assembled tool call that is **unusable** is a failed generation, not a result (§9).
 >
 > §3.1 records the downstream-channel properties that any change to the streaming path must
 > preserve, independent of the payload type.
@@ -200,6 +206,13 @@ level = "info"
 log_bodies = false                  # request/response bodies at trace level; off by default
 ```
 
+**Validation — *Amended (2026-08-24)*.** Values that parse but cannot work are refused at
+startup: a zero `max_attempts` (which would emit an empty successful stream without ever
+contacting the upstream), zero sizes or timeouts, a `backoff_multiplier` below 1 or
+non-finite, a `backoff_jitter` outside `0..=1`, a `backoff_max_ms` below the initial backoff,
+a `base_url` that is not an http/https URL, and an API key that cannot be encoded as a header.
+Durations are capped at one day, which keeps deadline arithmetic clear of `Instant` overflow.
+
 **Strictness — *Amended (2026-08-24)*.** Unknown keys are rejected in every section: a
 typo such as `max_attemps` would otherwise silently use the default for a security, timeout
 or endpoint setting. A config path named through `$LLM_PROXY_CONFIG` is treated as explicit,
@@ -248,6 +261,11 @@ cannot be valid JSON.
 | `GET /health` | `200 {"status":"ok"}`. No upstream call. |
 | anything else | `404` with an OpenAI-shaped error body. |
 
+**Request rejection — *Amended (2026-08-24)*:** malformed JSON, a missing or wrong content
+type, and an oversized body are all rejected by the extractor before the handler runs. Those
+rejections are mapped onto the OpenAI error schema rather than returned as axum's plain-text
+defaults, so a client parses a failure the same way whatever produced it.
+
 **Auth:** Client's `Authorization` header is discarded; the proxy always injects its own configured upstream API key if available.
 
 **Passthrough:** Request body is handled as untyped JSON (`serde_json::Value`). All client parameters (temperature, top_p, custom flags) survive untouched; only `messages` and `max_tokens` are rewritten for continuation attempts.
@@ -285,6 +303,18 @@ struct ResponseState {
     usage: UsageAccumulator,
 }
 ```
+
+**Usage accounting — *Amended (2026-08-24)*.** Upstream usage is cumulative *within* an
+attempt, so merging fields individually across attempts produced objects that never existed —
+a `prompt_tokens` from one attempt beside a `completion_tokens` from another. Whole snapshots
+are stored instead, which also preserves detail fields (`prompt_tokens_details`, cached and
+reasoning token counts) that a field-by-field copy discarded.
+
+What is reported downstream is the **final attempt's** snapshot: the numbers an unproxied
+request would have returned, which is what a client showing context usage expects. Summing
+across attempts would report several times the prompt for a retried request and read as a
+bug. The cross-attempt total is tracked separately and logged as `billed_prompt_tokens` /
+`billed_completion_tokens`, since only the proxy knows what was actually spent.
 
 ### 6.2 Outer loop
 
@@ -357,6 +387,14 @@ Every chunk forwarded downstream is rewritten:
 - `model` → `state.model`
 - `choices[0].delta.role` → emitted once, on the first chunk of the whole response only.
 - `choices[0].finish_reason` → suppressed during stream; forwarded only on terminal outcome.
+
+***Amended (2026-08-24)*:** where a delta carries exactly one payload field and dedup did not
+shorten it, the upstream chunk is forwarded with the fields above rewritten in place, rather
+than being rebuilt from scratch. Reconstruction silently discarded everything the proxy does
+not model — `logprobs`, `system_fingerprint`, `service_tier`, and provider extensions such as
+Gemini's `extra_content` — on every chunk of a clean first attempt. A chunk that *was*
+rewritten (dedup trimmed it, or the delta mixes fields that are emitted separately) is still
+rebuilt, since the surrounding metadata no longer describes what is being sent.
 
 ### 6.6 SSE framing
 
@@ -612,6 +650,16 @@ deadline is clamped to it.
     downstream and then retry — leaving the client with a broken call followed by its
     replacement, two calls for one intended invocation.
 - **Tool Call Passthrough (`buffer_tool_calls = false`):** Emit tool call deltas as they arrive, rewriting IDs and suppressing intermediate finish reasons. ***Amended (2026-08-24)*:** emit a chunk containing *only* the tool calls rather than forwarding the upstream object verbatim. A single upstream event may carry `content` and `reasoning` alongside `tool_calls`, and those are emitted by their own branches; forwarding the mixed source object sends them twice. Note that passthrough has **no equivalent of the §6.3 overlap window**: fragments already forwarded by an attempt that later fails cannot be recalled, so a cut mid-tool-call leaves the client holding the abandoned fragment as well as the complete retry. Buffering (the default) does not have this problem, because nothing is emitted until the call is whole.
+- **Refusals — *Amended (2026-08-24)*:** `delta.refusal` is a standard OpenAI field carrying a
+  model refusal in place of content. It is forwarded, deduplicated on its own window like
+  reasoning, excluded from continuation `messages`, and **counts as meaningful output** —
+  without which a refusal-only stream is invisible to the first-chunk watchdog (§8) and is
+  retried until give-up despite the upstream having answered.
+- **Unusable assembled calls — *Amended (2026-08-24)*:** before flushing, a buffered call must
+  have a non-empty `id`, a non-empty function name, and arguments that parse as JSON if
+  present. Inventing a placeholder id or an empty name produces a call the client cannot
+  execute — and duplicate placeholders collide when several calls are incomplete. An unusable
+  call is treated as a failed generation (§7.4) rather than forwarded.
 - **Reasoning / Thinking content:** Forward `delta.reasoning_content` / `delta.reasoning` downstream immediately, but **exclude from `accumulated_text` and continuation `messages`**.
   - ***Amended (2026-08-24)*:** reasoning gets its **own overlap window**, held in
     `accumulated_reasoning`. Excluding it from `accumulated_text` means an attempt that dies

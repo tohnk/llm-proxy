@@ -277,6 +277,8 @@ async fn spawn_proxy(base_url: String, customize: impl FnOnce(&mut Config)) -> S
 struct StreamResult {
     text: String,
     reasoning: String,
+    refusal: String,
+    chunks: Vec<Value>,
     chunk_ids: Vec<String>,
     done_count: usize,
     finish_reasons: Vec<String>,
@@ -307,6 +309,7 @@ async fn collect(client: &Client, proxy: SocketAddr, body: Value) -> StreamResul
             continue;
         }
         let json: Value = serde_json::from_str(data).expect("downstream chunk must be JSON");
+        out.chunks.push(json.clone());
 
         if let Some(err) = json.get("error") {
             out.errors.push(err.clone());
@@ -331,6 +334,9 @@ async fn collect(client: &Client, proxy: SocketAddr, body: Value) -> StreamResul
             }
             if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
                 out.text.push_str(c);
+            }
+            if let Some(r) = delta.get("refusal").and_then(|r| r.as_str()) {
+                out.refusal.push_str(r);
             }
             for field in ["reasoning_content", "reasoning"] {
                 if let Some(r) = delta.get(field).and_then(|r| r.as_str()) {
@@ -1645,4 +1651,230 @@ async fn test_client_that_stops_reading_is_abandoned_at_the_deadline() {
         closed < 5_000,
         "abandonment took {closed}ms; the send should be bounded by the wall clock"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Refusals, metadata preservation, usage, and unusable tool calls
+// ---------------------------------------------------------------------------
+
+/// §9 / M7: `delta.refusal` is a standard OpenAI field. Unhandled it is both
+/// dropped and invisible to the first-chunk watchdog, so a refusal-only stream
+/// looks like an upstream that never spoke and is retried until give-up.
+#[tokio::test]
+async fn test_refusal_delta_is_forwarded() {
+    let upstream = spawn_raw_upstream(|_req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let mut delta = serde_json::Map::new();
+            delta.insert("role".into(), json!("assistant"));
+            delta.insert("refusal".into(), json!("I can't help with that."));
+            write_sse(
+                &mut sock,
+                &json!({
+                    "id": "upstream-raw",
+                    "object": "chat.completion.chunk",
+                    "created": 1690000000,
+                    "model": "raw-mock-model",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}]
+                }),
+            )
+            .await;
+            write_sse(&mut sock, &finish_chunk("stop")).await;
+            write_done(&mut sock).await;
+            end_stream_cleanly(&mut sock).await;
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |config| {
+        // Short enough that a dropped refusal would trip the watchdog.
+        config.resume.first_chunk_timeout_secs = 2;
+    })
+    .await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(
+        upstream.requests(),
+        1,
+        "a refusal is output, so the first-chunk watchdog must not fire"
+    );
+    assert_eq!(result.refusal, "I can't help with that.");
+    assert_eq!(result.finish_reasons, vec!["stop".to_string()]);
+    assert_eq!(result.done_count, 1);
+}
+
+/// §6.5 / M8: fields the proxy does not model must survive a clean pass-through.
+/// Rebuilding every chunk from scratch silently dropped `logprobs`,
+/// `system_fingerprint`, and provider extensions such as Gemini's
+/// `extra_content`.
+#[tokio::test]
+async fn test_upstream_chunk_metadata_is_preserved() {
+    let upstream = spawn_raw_upstream(|_req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            write_sse(
+                &mut sock,
+                &json!({
+                    "id": "upstream-raw",
+                    "object": "chat.completion.chunk",
+                    "created": 1690000000,
+                    "model": "raw-mock-model",
+                    "system_fingerprint": "fp_abc123",
+                    "service_tier": "default",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": "hi",
+                            "extra_content": {"google": {"thought_signature": "sig"}}
+                        },
+                        "logprobs": {"content": []},
+                        "finish_reason": Value::Null
+                    }]
+                }),
+            )
+            .await;
+            write_sse(&mut sock, &finish_chunk("stop")).await;
+            write_done(&mut sock).await;
+            end_stream_cleanly(&mut sock).await;
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |_| {}).await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(result.text, "hi");
+    let content_chunk = result
+        .chunks
+        .iter()
+        .find(|c| c["choices"][0]["delta"].get("content").is_some())
+        .expect("a content chunk should have been emitted");
+
+    assert_eq!(content_chunk["system_fingerprint"], "fp_abc123");
+    assert_eq!(content_chunk["service_tier"], "default");
+    assert!(content_chunk["choices"][0]["logprobs"].is_object());
+    assert_eq!(
+        content_chunk["choices"][0]["delta"]["extra_content"]["google"]["thought_signature"],
+        "sig"
+    );
+    // §6.5 still applies to the fields the proxy does own.
+    assert!(content_chunk["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("chatcmpl-"));
+    assert!(content_chunk["choices"][0]["finish_reason"].is_null());
+}
+
+/// §6.1 / M11: usage must be one attempt's coherent snapshot, not a mixture of
+/// fields taken from different attempts, and detail fields must survive.
+#[tokio::test]
+async fn test_usage_reports_a_single_coherent_snapshot() {
+    let upstream = spawn_raw_upstream(|req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let usage = |p: u64, c: u64| {
+                json!({
+                    "id": "upstream-raw",
+                    "object": "chat.completion.chunk",
+                    "created": 1690000000,
+                    "model": "raw-mock-model",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": p,
+                        "completion_tokens": c,
+                        "total_tokens": p + c,
+                        "prompt_tokens_details": {"cached_tokens": p / 2}
+                    }
+                })
+            };
+
+            if req.num == 1 {
+                write_sse(&mut sock, &content_chunk("part ", true)).await;
+                write_sse(&mut sock, &usage(500, 11)).await;
+                truncate_mid_chunk(sock).await;
+            } else {
+                write_sse(&mut sock, &content_chunk("done", false)).await;
+                write_sse(&mut sock, &usage(70, 3)).await;
+                write_sse(&mut sock, &finish_chunk("stop")).await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            }
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |_| {}).await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(upstream.requests(), 2);
+    let usage = result
+        .chunks
+        .iter()
+        .find_map(|c| c.get("usage").filter(|u| !u.is_null()).cloned())
+        .expect("terminal chunk should carry usage");
+
+    // The final attempt's numbers, never a blend of the two.
+    assert_eq!(usage["prompt_tokens"], 70);
+    assert_eq!(usage["completion_tokens"], 3);
+    assert_eq!(usage["total_tokens"], 73);
+    assert_eq!(
+        usage["prompt_tokens_details"]["cached_tokens"], 35,
+        "detail fields must not be discarded"
+    );
+}
+
+/// §9 / M6: a finished-looking but unusable tool call — no id, no name, or
+/// unparseable arguments — cannot be executed by the client, so it is a failed
+/// generation rather than a result to forward.
+#[tokio::test]
+async fn test_unusable_tool_calls_are_retried_not_emitted() {
+    let upstream = spawn_raw_upstream(|req, mut sock| {
+        Box::pin(async move {
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            if req.num == 1 {
+                // No id, and arguments that never close.
+                write_sse(
+                    &mut sock,
+                    &tool_delta_chunk(
+                        json!([{"index": 0, "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{\"city\":"}}]),
+                        true,
+                    ),
+                )
+                .await;
+                write_sse(&mut sock, &finish_chunk("tool_calls")).await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            } else {
+                write_sse(
+                    &mut sock,
+                    &tool_delta_chunk(
+                        json!([{"index": 0, "id": "call_ok", "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{\"city\":\"Rome\"}"}}]),
+                        true,
+                    ),
+                )
+                .await;
+                write_sse(&mut sock, &finish_chunk("tool_calls")).await;
+                write_done(&mut sock).await;
+                end_stream_cleanly(&mut sock).await;
+            }
+        })
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream.base_url(), |_| {}).await;
+    let result = collect(&test_client(), proxy, chat_body()).await;
+
+    assert_eq!(
+        upstream.requests(),
+        2,
+        "the unusable call should be retried"
+    );
+    assert_eq!(result.tool_call_chunks.len(), 1);
+    let calls = result.tool_call_chunks[0].as_array().unwrap();
+    assert_eq!(calls[0]["id"], "call_ok");
+    assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Rome\"}");
+    assert_eq!(result.done_count, 1);
 }

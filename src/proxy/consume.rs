@@ -14,8 +14,9 @@ use crate::error::{
     ApiError, AttemptOutcome, Cause,
 };
 use crate::proxy::chunks::{
-    build_chunk_with_content, build_chunk_with_reasoning, build_chunk_with_tool_calls,
-    format_sse_data, parse_chunk_details, rewrite_upstream_chunk, UsageAccumulator,
+    build_chunk_with_content, build_chunk_with_delta_field, build_chunk_with_tool_calls,
+    format_sse_data, parse_chunk_details, passthrough_upstream_chunk, rewrite_upstream_chunk,
+    UsageAccumulator,
 };
 use crate::proxy::dedup::DedupBuffer;
 use crate::proxy::tools::ToolCallsBuffer;
@@ -78,6 +79,9 @@ pub struct StreamConsumerState<'a> {
     /// Reasoning emitted downstream so far. Deduplicated like content (§9) but
     /// deliberately excluded from continuation `messages`.
     pub accumulated_reasoning: &'a mut String,
+    /// Refusal text already shown to the client. Deduplicated like reasoning and
+    /// likewise excluded from continuation `messages`.
+    pub accumulated_refusal: &'a mut String,
     /// Count of payload frames sent downstream across all attempts. Content is
     /// not the only thing a client can have received — reasoning and passthrough
     /// tool deltas go out without touching `accumulated_text` — so decisions
@@ -142,6 +146,11 @@ pub async fn consume_upstream_stream(
     );
     let mut reasoning_dedup = DedupBuffer::new(
         state.accumulated_reasoning,
+        config.resume.dedup_window_chars,
+        attempt == 1,
+    );
+    let mut refusal_dedup = DedupBuffer::new(
+        state.accumulated_refusal,
         config.resume.dedup_window_chars,
         attempt == 1,
     );
@@ -278,6 +287,14 @@ pub async fn consume_upstream_stream(
 
         let details = parse_chunk_details(&chunk_json);
 
+        // Captured before the branches below move the fields out. A chunk whose
+        // delta carries exactly one payload field can be forwarded verbatim;
+        // a mixed one must be rebuilt per field (§6.5).
+        let has_content = details.content.is_some();
+        let has_reasoning = details.reasoning.is_some();
+        let has_refusal = details.refusal.is_some();
+        let has_tool_calls = details.tool_calls.is_some();
+
         // Update model name if this is the first time we see it from upstream chunks
         if let Some(m) = details.model {
             if !*state.model_frozen {
@@ -296,9 +313,10 @@ pub async fn consume_upstream_stream(
             last_finish_reason = Some(fr);
         }
 
-        let has_meaningful_delta = details.reasoning.is_some()
-            || details.tool_calls.is_some()
-            || details.content.is_some();
+        // A refusal counts: without it a refusal-only delta looks role-only, and
+        // the role branch forwards the whole chunk — refusal field included —
+        // which the refusal branch below then emits a second time.
+        let has_meaningful_delta = has_reasoning || has_tool_calls || has_content || has_refusal;
         if details.has_role && !has_meaningful_delta && !*state.emitted_role {
             *state.attempt_had_meaningful_chunk = true;
             rewrite_upstream_chunk(
@@ -347,12 +365,57 @@ pub async fn consume_upstream_stream(
                         return Ok(AttemptOutcome::Terminal("length".to_string()));
                     }
                     state.accumulated_reasoning.push_str(&text);
-                    let chunk = build_chunk_with_reasoning(
+                    let chunk =
+                        if text == reasoning && !has_content && !has_refusal && !has_tool_calls {
+                            // Untrimmed and the only payload field: keep whatever
+                            // metadata the upstream attached (§6.5).
+                            passthrough_upstream_chunk(
+                                &chunk_json,
+                                state.downstream_id,
+                                state.created,
+                                state.model,
+                                state.emitted_role,
+                            )
+                        } else {
+                            build_chunk_with_delta_field(
+                                state.downstream_id,
+                                state.created,
+                                state.model,
+                                reasoning_field,
+                                &text,
+                                !*state.emitted_role,
+                            )
+                        };
+                    *state.emitted_role = true;
+                    if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+                        .await
+                        .is_err()
+                    {
+                        debug!("Downstream client disconnected while sending reasoning");
+                        return Err(ClientDisconnected);
+                    }
+                    *state.emitted_payloads += 1;
+                }
+            }
+        }
+
+        // §9 / M7: `delta.refusal` is a standard OpenAI field carrying a model
+        // refusal in place of content. Left unhandled it is both dropped and
+        // invisible to the first-chunk watchdog, so a refusal-only stream looks
+        // like an upstream that never spoke and is retried until give-up.
+        if let Some(refusal) = details.refusal.clone() {
+            received_first_meaningful_chunk = true;
+            *state.attempt_had_meaningful_chunk = true;
+
+            if let Some(text) = refusal_dedup.push_delta(&refusal) {
+                if !text.is_empty() {
+                    state.accumulated_refusal.push_str(&text);
+                    let chunk = build_chunk_with_delta_field(
                         state.downstream_id,
                         state.created,
                         state.model,
+                        "refusal",
                         &text,
-                        reasoning_field,
                         !*state.emitted_role,
                     );
                     *state.emitted_role = true;
@@ -360,7 +423,7 @@ pub async fn consume_upstream_stream(
                         .await
                         .is_err()
                     {
-                        debug!("Downstream client disconnected while sending reasoning");
+                        debug!("Downstream client disconnected while sending refusal");
                         return Err(ClientDisconnected);
                     }
                     *state.emitted_payloads += 1;
@@ -413,13 +476,29 @@ pub async fn consume_upstream_stream(
                         return Ok(AttemptOutcome::Terminal("length".to_string()));
                     }
                     state.accumulated_text.push_str(&text_to_forward);
-                    let chunk = build_chunk_with_content(
-                        state.downstream_id,
-                        state.created,
-                        state.model,
-                        &text_to_forward,
-                        !*state.emitted_role,
-                    );
+                    let content_only = !has_reasoning && !has_refusal && !has_tool_calls;
+                    let chunk = if text_to_forward == content && content_only {
+                        // Nothing was trimmed and content is the only payload,
+                        // so the upstream chunk still describes what is being
+                        // sent: forward it rather than rebuilding, keeping
+                        // logprobs, system_fingerprint and provider extensions
+                        // that the proxy does not model (§6.5).
+                        passthrough_upstream_chunk(
+                            &chunk_json,
+                            state.downstream_id,
+                            state.created,
+                            state.model,
+                            state.emitted_role,
+                        )
+                    } else {
+                        build_chunk_with_content(
+                            state.downstream_id,
+                            state.created,
+                            state.model,
+                            &text_to_forward,
+                            !*state.emitted_role,
+                        )
+                    };
                     *state.emitted_role = true;
 
                     if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
@@ -457,15 +536,37 @@ pub async fn consume_upstream_stream(
         *state.emitted_payloads += 1;
     }
 
-    // Flush any reasoning still held behind its overlap window.
-    if let Some(text) = reasoning_dedup.finish() {
-        state.accumulated_reasoning.push_str(&text);
-        let chunk = build_chunk_with_reasoning(
+    // Flush any refusal still held behind its overlap window.
+    if let Some(text) = refusal_dedup.finish() {
+        state.accumulated_refusal.push_str(&text);
+        let chunk = build_chunk_with_delta_field(
             state.downstream_id,
             state.created,
             state.model,
+            "refusal",
             &text,
+            !*state.emitted_role,
+        );
+        *state.emitted_role = true;
+        if send_downstream(downstream_tx, format_sse_data(&chunk), wall_clock_deadline)
+            .await
+            .is_err()
+        {
+            debug!("Downstream client disconnected during refusal flush");
+            return Err(ClientDisconnected);
+        }
+        *state.emitted_payloads += 1;
+    }
+
+    // Flush any reasoning still held behind its overlap window.
+    if let Some(text) = reasoning_dedup.finish() {
+        state.accumulated_reasoning.push_str(&text);
+        let chunk = build_chunk_with_delta_field(
+            state.downstream_id,
+            state.created,
+            state.model,
             "reasoning_content",
+            &text,
             !*state.emitted_role,
         );
         *state.emitted_role = true;
@@ -512,7 +613,15 @@ pub async fn consume_upstream_stream(
                 return Ok(AttemptOutcome::Retryable(Cause::MalformedFunctionCall));
             }
 
-            if tool_buffer.is_truncated() {
+            // A call that is finished but unusable is a failed generation: the
+            // client cannot execute it, and another attempt may well produce a
+            // valid one (§7.4).
+            if normalized == "tool_calls" && config.tools.buffer_tool_calls {
+                if let Err(reason) = tool_buffer.validate() {
+                    warn!(reason = %reason, "Assembled tool call is unusable; discarding and retrying");
+                    return Ok(AttemptOutcome::Retryable(Cause::MalformedFunctionCall));
+                }
+            } else if tool_buffer.is_truncated() {
                 warn!(
                     limit = config.tools.max_tool_call_bytes,
                     "Tool call arguments exceeded the configured limit; discarding and retrying"
